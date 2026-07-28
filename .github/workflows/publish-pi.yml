@@ -8,6 +8,7 @@ on:
 
 jobs:
   publish:
+    if: github.repository == 'Gentleman-Programming/engram'
     runs-on: ubuntu-latest
     permissions:
       contents: read
