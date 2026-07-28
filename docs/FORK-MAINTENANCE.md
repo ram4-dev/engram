@@ -44,6 +44,25 @@ Only successful validation may create or update a draft pull request. A human
 must review the source diff, confirm the checks, and apply the `type:chore`
 label manually. The workflow never approves or merges a pull request.
 
+When the workflow creates a new draft pull request, it sends a plain-text
+Telegram notification containing the release tag and pull request URL. After
+Telegram confirms the expected chat and optional topic, the workflow adds a
+hidden delivery marker to the pull request body. Updating an existing candidate
+does not send another notification while that marker is present.
+
+Telegram delivery is fail-closed: a missing credential, rejected request, or
+mismatched destination fails the workflow after the pull request has been
+created. Rerunning the workflow retries delivery while the marker is absent.
+This provides at-least-once delivery. A timeout after Telegram accepts a message
+can still produce a duplicate because the Bot API has no idempotency key.
+
+Configure the following repository settings:
+
+- Actions secret `TELEGRAM_BOT_TOKEN`: BotFather token for the sending bot.
+- Actions secret `TELEGRAM_CHAT_ID`: numeric destination chat identifier.
+- Actions variable `TELEGRAM_MESSAGE_THREAD_ID`: optional positive topic
+  identifier for a forum destination.
+
 Repository settings must allow GitHub Actions to create pull requests for the
 `GITHUB_TOKEN` used here. GitHub also restricts workflow chaining and approvals
 originating from `GITHUB_TOKEN`; do not treat the automation's PR authorship as
