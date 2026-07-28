@@ -46,9 +46,9 @@ label manually. The workflow never approves or merges a pull request.
 
 When the workflow creates a new draft pull request, it sends a plain-text
 Telegram notification containing the release tag and pull request URL. After
-Telegram confirms the expected chat and optional topic, the workflow adds a
-hidden delivery marker to the pull request body. Updating an existing candidate
-does not send another notification while that marker is present.
+Telegram confirms the expected private chat, the workflow adds a hidden
+delivery marker to the pull request body. Updating an existing candidate does
+not send another notification while that marker is present.
 
 Telegram delivery is fail-closed: a missing credential, rejected request, or
 mismatched destination fails the workflow after the pull request has been
@@ -59,9 +59,14 @@ can still produce a duplicate because the Bot API has no idempotency key.
 Configure the following repository settings:
 
 - Actions secret `TELEGRAM_BOT_TOKEN`: BotFather token for the sending bot.
-- Actions secret `TELEGRAM_CHAT_ID`: numeric destination chat identifier.
-- Actions variable `TELEGRAM_MESSAGE_THREAD_ID`: optional positive topic
-  identifier for a forum destination.
+- Actions secret `TELEGRAM_CHAT_ID`: positive numeric identifier of the
+  repository owner's private Telegram chat.
+
+This repository's release notifications are direct-private-only. Before
+sending, the workflow calls `getMe` and requires the bot's private-topic mode to
+be disabled, then calls `getChat` and requires a positive user identifier and
+chat type `private`. It also rejects `sendMessage` responses containing topic
+metadata. Do not configure a topic or a Compass group destination.
 
 Repository settings must allow GitHub Actions to create pull requests for the
 `GITHUB_TOKEN` used here. GitHub also restricts workflow chaining and approvals

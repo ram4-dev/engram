@@ -346,7 +346,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_MESSAGE_THREAD_ID: ${{ vars.TELEGRAM_MESSAGE_THREAD_ID }}
           PR_NUMBER: ${{ steps.pull_request.outputs.number }}
           PR_URL: ${{ steps.pull_request.outputs.url }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
@@ -357,20 +356,9 @@ jobs:
             echo "Telegram notification credentials are not configured" >&2
             exit 1
           fi
-          if [[ ! "$TELEGRAM_CHAT_ID" =~ ^-?[1-9][0-9]*$ ]]; then
-            echo "TELEGRAM_CHAT_ID must be an integer" >&2
+          if [[ ! "$TELEGRAM_CHAT_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "TELEGRAM_CHAT_ID must identify a private user chat" >&2
             exit 1
-          fi
-
-          thread_args=()
-          if [[ -n "$TELEGRAM_MESSAGE_THREAD_ID" ]]; then
-            if [[ ! "$TELEGRAM_MESSAGE_THREAD_ID" =~ ^[1-9][0-9]*$ ]]; then
-              echo "TELEGRAM_MESSAGE_THREAD_ID must be a positive integer" >&2
-              exit 1
-            fi
-            thread_args=(
-              --data-urlencode "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}"
-            )
           fi
 
           message="$(
@@ -381,8 +369,46 @@ jobs:
               "${PR_URL}" \
               "Status: draft; human review required."
           )"
+          bot_response_file="$(mktemp)"
+          chat_response_file="$(mktemp)"
           response_file="$(mktemp)"
-          trap 'rm -f "$response_file"' EXIT
+          trap 'rm -f "$bot_response_file" "$chat_response_file" "$response_file"' EXIT
+
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" \
+            --output "$bot_response_file"
+
+          if ! jq -e \
+            '.ok == true and
+             (.result.has_topics_enabled // false) == false' \
+            "$bot_response_file" >/dev/null; then
+            echo "Telegram bot private-topic mode must be disabled" >&2
+            exit 1
+          fi
+
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getChat" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --output "$chat_response_file"
+
+          if ! jq -e \
+            '.ok == true and
+             .result.type == "private"' \
+            "$chat_response_file" >/dev/null; then
+            echo "Telegram destination is not a direct private chat" >&2
+            exit 1
+          fi
 
           curl \
             --fail \
@@ -393,14 +419,18 @@ jobs:
             --request POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            "${thread_args[@]}" \
             --data-urlencode "text=${message}" \
             --data-urlencode "disable_web_page_preview=true" \
             --output "$response_file"
 
-          if ! jq -e '.ok == true and .result.message_id != null' \
+          if ! jq -e \
+            '.ok == true and
+             .result.message_id != null and
+             .result.chat.type == "private" and
+             (.result.is_topic_message // false) == false and
+             (.result | has("message_thread_id") | not)' \
             "$response_file" >/dev/null; then
-            echo "Telegram did not confirm message delivery" >&2
+            echo "Telegram did not confirm direct private message delivery" >&2
             exit 1
           fi
 
@@ -410,19 +440,9 @@ jobs:
             exit 1
           fi
 
-          if [[ -n "$TELEGRAM_MESSAGE_THREAD_ID" ]]; then
-            actual_thread_id="$(
-              jq -r '.result.message_thread_id // empty' "$response_file"
-            )"
-            if [[ "$actual_thread_id" != "$TELEGRAM_MESSAGE_THREAD_ID" ]]; then
-              echo "Telegram confirmed an unexpected topic" >&2
-              exit 1
-            fi
-          fi
-
           body_file="$(mktemp)"
           payload_file="$(mktemp)"
-          trap 'rm -f "$response_file" "$body_file" "$payload_file"' EXIT
+          trap 'rm -f "$bot_response_file" "$chat_response_file" "$response_file" "$body_file" "$payload_file"' EXIT
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
             --jq '.body // ""' > "$body_file"
           if ! grep -Fq '<!-- engram-telegram-notified -->' "$body_file"; then
