@@ -1,0 +1,306 @@
+name: Prepare upstream release candidate
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-release-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.repository == 'ram4-dev/engram'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      has_candidate: ${{ steps.prepare.outputs.has_candidate }}
+      base_branch: ${{ steps.prepare.outputs.base_branch }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      candidate_branch: ${{ steps.prepare.outputs.candidate_branch }}
+      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+      release_tag: ${{ steps.prepare.outputs.release_tag }}
+    steps:
+      - name: Checkout fork base
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Prepare deterministic candidate branch
+        id: prepare
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          upstream_repository="Gentleman-Programming/engram"
+          upstream_url="https://github.com/${upstream_repository}.git"
+          base_sha="$(git rev-parse HEAD)"
+
+          echo "has_candidate=false" >> "$GITHUB_OUTPUT"
+          echo "base_branch=$BASE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+          release_tag="$(
+            gh api --method GET --paginate \
+              "repos/${upstream_repository}/releases?per_page=100" |
+              jq -s -r '
+                add
+                | map(
+                    select(.draft == false and .prerelease == false)
+                    | .tag_name
+                    | select(test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    | {
+                        tag: .,
+                        key: (
+                          capture("^v(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$")
+                          | [.major, .minor, .patch]
+                          | map(tonumber)
+                        )
+                      }
+                  )
+                | sort_by(.key)
+                | last
+                | .tag // empty
+              '
+          )"
+          if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "no stable strict-semver upstream release found" >&2
+            exit 1
+          fi
+
+          baseline_schema="$(jq -er '.schema_version' fork/upstream.json)"
+          baseline_repository="$(jq -er '.repository' fork/upstream.json)"
+          baseline_tag="$(jq -er '.tag' fork/upstream.json)"
+          baseline_commit="$(jq -er '.commit' fork/upstream.json)"
+          if [[ "$baseline_schema" != "1" ]] ||
+             [[ "$baseline_repository" != "$upstream_repository" ]] ||
+             [[ ! "$baseline_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+             [[ ! "$baseline_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "fork/upstream.json is invalid" >&2
+            exit 1
+          fi
+
+          newest_tag="$(printf '%s\n' "$baseline_tag" "$release_tag" | sort -V | tail -n1)"
+          if [[ "$newest_tag" != "$release_tag" ]]; then
+            echo "latest upstream release $release_tag is older than baseline $baseline_tag" >&2
+            exit 1
+          fi
+
+          release_ref="refs/remotes/upstream-releases/${release_tag}"
+          main_ref="refs/remotes/upstream-sync/main"
+          git fetch --no-tags "$upstream_url" \
+            "+refs/tags/${release_tag}:${release_ref}" \
+            "+refs/heads/main:${main_ref}"
+          release_commit="$(git rev-parse "${release_ref}^{commit}")"
+          if [[ ! "$release_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "could not resolve $release_tag to a full commit" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$release_commit" "$main_ref"; then
+            echo "$release_tag commit is not reachable from upstream/main" >&2
+            exit 1
+          fi
+          if [[ "$release_tag" == "$baseline_tag" ]]; then
+            if [[ "$release_commit" != "$baseline_commit" ]]; then
+              echo "$release_tag was retagged from $baseline_commit to $release_commit" >&2
+              exit 1
+            fi
+            echo "fork is already based on latest stable release $release_tag"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$baseline_commit" "$release_commit"; then
+            echo "$baseline_commit is not an ancestor of $release_tag commit $release_commit" >&2
+            exit 1
+          fi
+
+          candidate_branch="ci/upstream-${release_tag}"
+          git switch --force-create "$candidate_branch" "$base_sha"
+          git read-tree --reset -u "$release_commit"
+          git restore --source="$base_sha" --staged --worktree -- \
+            .github \
+            fork \
+            docs/FORK-MAINTENANCE.md
+
+          metadata_file="$(mktemp)"
+          jq -n \
+            --arg repository "$upstream_repository" \
+            --arg tag "$release_tag" \
+            --arg commit "$release_commit" \
+            '{
+              schema_version: 1,
+              repository: $repository,
+              tag: $tag,
+              commit: $commit
+            }' > "$metadata_file"
+          mv "$metadata_file" fork/upstream.json
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "candidate snapshot produced no changes" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: prepare upstream ${release_tag}"
+          candidate_sha="$(git rev-parse HEAD)"
+
+          remote_sha="$(
+            git ls-remote --heads origin "refs/heads/${candidate_branch}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [[ -n "$remote_sha" ]]; then
+            git push \
+              --force-with-lease="refs/heads/${candidate_branch}:${remote_sha}" \
+              origin "HEAD:refs/heads/${candidate_branch}"
+          else
+            git push origin "HEAD:refs/heads/${candidate_branch}"
+          fi
+
+          echo "has_candidate=true" >> "$GITHUB_OUTPUT"
+          echo "candidate_branch=$candidate_branch" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+  validate:
+    needs: prepare
+    if: needs.prepare.outputs.has_candidate == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.candidate_sha }}
+
+      - name: Verify protected fork content
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git diff --exit-code "$BASE_SHA" "$CANDIDATE_SHA" -- .github
+          git diff --exit-code "$BASE_SHA" "$CANDIDATE_SHA" -- \
+            fork \
+            ':(exclude)fork/upstream.json'
+          git diff --exit-code "$BASE_SHA" "$CANDIDATE_SHA" -- \
+            docs/FORK-MAINTENANCE.md
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Validate candidate
+        run: fork/validate-upstream-candidate.sh "${{ needs.prepare.outputs.release_tag }}"
+
+  pull-request:
+    needs:
+      - prepare
+      - validate
+    if: needs.prepare.outputs.has_candidate == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Create or update draft pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ needs.prepare.outputs.base_branch }}
+          CANDIDATE_BRANCH: ${{ needs.prepare.outputs.candidate_branch }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          UPSTREAM_SYNC_ISSUE: ${{ vars.UPSTREAM_SYNC_ISSUE }}
+        run: |
+          set -euo pipefail
+
+          remote_candidate_sha="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/heads/${CANDIDATE_BRANCH}" \
+              --jq '.object.sha'
+          )"
+          if [[ "$remote_candidate_sha" != "$CANDIDATE_SHA" ]]; then
+            echo "candidate branch moved from $CANDIDATE_SHA to $remote_candidate_sha" >&2
+            exit 1
+          fi
+
+          issue="${UPSTREAM_SYNC_ISSUE:-1}"
+          if [[ ! "$issue" =~ ^[1-9][0-9]*$ ]]; then
+            echo "UPSTREAM_SYNC_ISSUE must be a positive integer" >&2
+            exit 1
+          fi
+
+          title="chore: sync upstream ${RELEASE_TAG}"
+          body_file="$(mktemp)"
+          payload_file="$(mktemp)"
+          trap 'rm -f "$body_file" "$payload_file"' EXIT
+          cat > "$body_file" <<EOF
+          ## Upstream release candidate
+
+          This draft overlays the ${RELEASE_TAG} source tree from \`Gentleman-Programming/engram\` while preserving this fork's protected automation and maintenance files.
+
+          - Candidate commit: \`${CANDIDATE_SHA}\`
+          - Automated validation completed before this PR was opened or updated.
+          - Human review is required before merge.
+          - Apply the \`type:chore\` label manually after review.
+          - No approval, merge, tag, release, package, or image publication is automated.
+
+          Closes #${issue}
+          EOF
+
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          number="$(
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f state=open \
+              -f head="${owner}:${CANDIDATE_BRANCH}" \
+              -f base="$BASE_BRANCH" \
+              --jq '.[0].number // empty'
+          )"
+
+          if [[ -n "$number" ]]; then
+            jq -n \
+              --arg title "$title" \
+              --rawfile body "$body_file" \
+              --arg base "$BASE_BRANCH" \
+              '{title: $title, body: $body, base: $base}' > "$payload_file"
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/pulls/${number}" \
+              --input "$payload_file" >/dev/null
+            is_draft="$(
+              gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" --jq '.draft'
+            )"
+            if [[ "$is_draft" != "true" ]]; then
+              gh pr ready "$number" --undo --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            jq -n \
+              --arg title "$title" \
+              --rawfile body "$body_file" \
+              --arg head "$CANDIDATE_BRANCH" \
+              --arg base "$BASE_BRANCH" \
+              '{
+                title: $title,
+                body: $body,
+                head: $head,
+                base: $base,
+                draft: true
+              }' > "$payload_file"
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/pulls" \
+              --input "$payload_file" >/dev/null
+          fi
