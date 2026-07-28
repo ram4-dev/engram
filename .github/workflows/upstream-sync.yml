@@ -218,6 +218,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Create or update draft pull request
+        id: pull_request
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -248,7 +249,9 @@ jobs:
           title="chore: sync upstream ${RELEASE_TAG}"
           body_file="$(mktemp)"
           payload_file="$(mktemp)"
-          trap 'rm -f "$body_file" "$payload_file"' EXIT
+          response_file="$(mktemp)"
+          existing_body_file="$(mktemp)"
+          trap 'rm -f "$body_file" "$payload_file" "$response_file" "$existing_body_file"' EXIT
           cat > "$body_file" <<EOF
           ## Upstream release candidate
 
@@ -272,7 +275,19 @@ jobs:
               --jq '.[0].number // empty'
           )"
 
+          created=false
+          notify_required=true
           if [[ -n "$number" ]]; then
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" \
+              > "$response_file"
+            pr_url="$(jq -r '.html_url' "$response_file")"
+            jq -r '.body // ""' "$response_file" > "$existing_body_file"
+            if grep -Fq '<!-- engram-telegram-notified -->' \
+              "$existing_body_file"; then
+              printf '\n<!-- engram-telegram-notified -->\n' >> "$body_file"
+              notify_required=false
+            fi
+
             jq -n \
               --arg title "$title" \
               --rawfile body "$body_file" \
@@ -302,5 +317,118 @@ jobs:
               }' > "$payload_file"
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/pulls" \
+              --input "$payload_file" > "$response_file"
+            number="$(jq -r '.number' "$response_file")"
+            pr_url="$(jq -r '.html_url' "$response_file")"
+            created=true
+          fi
+
+          if [[ ! "$number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pull request response did not include a valid number" >&2
+            exit 1
+          fi
+          if [[ "$pr_url" != "https://github.com/${GITHUB_REPOSITORY}/pull/${number}" ]]; then
+            echo "pull request response contained an unexpected URL" >&2
+            exit 1
+          fi
+
+          {
+            echo "created=$created"
+            echo "notify_required=$notify_required"
+            echo "number=$number"
+            echo "url=$pr_url"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram about new draft pull request
+        if: steps.pull_request.outputs.notify_required == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ vars.TELEGRAM_MESSAGE_THREAD_ID }}
+          PR_NUMBER: ${{ steps.pull_request.outputs.number }}
+          PR_URL: ${{ steps.pull_request.outputs.url }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
+            echo "Telegram notification credentials are not configured" >&2
+            exit 1
+          fi
+          if [[ ! "$TELEGRAM_CHAT_ID" =~ ^-?[1-9][0-9]*$ ]]; then
+            echo "TELEGRAM_CHAT_ID must be an integer" >&2
+            exit 1
+          fi
+
+          thread_args=()
+          if [[ -n "$TELEGRAM_MESSAGE_THREAD_ID" ]]; then
+            if [[ ! "$TELEGRAM_MESSAGE_THREAD_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "TELEGRAM_MESSAGE_THREAD_ID must be a positive integer" >&2
+              exit 1
+            fi
+            thread_args=(
+              --data-urlencode "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}"
+            )
+          fi
+
+          message="$(
+            printf '%s\n' \
+              "Engram fork: validated upstream sync PR opened" \
+              "Release: ${RELEASE_TAG}" \
+              "PR: #${PR_NUMBER}" \
+              "${PR_URL}" \
+              "Status: draft; human review required."
+          )"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            "${thread_args[@]}" \
+            --data-urlencode "text=${message}" \
+            --data-urlencode "disable_web_page_preview=true" \
+            --output "$response_file"
+
+          if ! jq -e '.ok == true and .result.message_id != null' \
+            "$response_file" >/dev/null; then
+            echo "Telegram did not confirm message delivery" >&2
+            exit 1
+          fi
+
+          actual_chat_id="$(jq -r '.result.chat.id // empty' "$response_file")"
+          if [[ "$actual_chat_id" != "$TELEGRAM_CHAT_ID" ]]; then
+            echo "Telegram confirmed an unexpected destination" >&2
+            exit 1
+          fi
+
+          if [[ -n "$TELEGRAM_MESSAGE_THREAD_ID" ]]; then
+            actual_thread_id="$(
+              jq -r '.result.message_thread_id // empty' "$response_file"
+            )"
+            if [[ "$actual_thread_id" != "$TELEGRAM_MESSAGE_THREAD_ID" ]]; then
+              echo "Telegram confirmed an unexpected topic" >&2
+              exit 1
+            fi
+          fi
+
+          body_file="$(mktemp)"
+          payload_file="$(mktemp)"
+          trap 'rm -f "$response_file" "$body_file" "$payload_file"' EXIT
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '.body // ""' > "$body_file"
+          if ! grep -Fq '<!-- engram-telegram-notified -->' "$body_file"; then
+            printf '\n<!-- engram-telegram-notified -->\n' >> "$body_file"
+            jq -n --rawfile body "$body_file" '{body: $body}' > "$payload_file"
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
               --input "$payload_file" >/dev/null
           fi
