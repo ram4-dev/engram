@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudstore"
 	nethtml "golang.org/x/net/html"
 )
 
@@ -1288,9 +1288,10 @@ func newAuthedAdminMux(store DashboardStore) *http.ServeMux {
 			}
 			return errUnauthorized
 		},
-		IsAdmin:        func(_ *http.Request) bool { return true },
-		GetDisplayName: func(_ *http.Request) string { return "OPERATOR" },
-		Store:          store,
+		IsAdmin:               func(_ *http.Request) bool { return true },
+		CanManageManagedUsers: func(_ *http.Request) bool { return true },
+		GetDisplayName:        func(_ *http.Request) string { return "OPERATOR" },
+		Store:                 store,
 	}
 	if managed, ok := store.(ManagedUsersStore); ok {
 		cfg.ManagedUsers = managed
@@ -3194,5 +3195,34 @@ func TestAdminAuditLogListIsPartialOnlyNoLayoutWrapper(t *testing.T) {
 	// Partial-only: must NOT contain <html> tag (that would be a full Layout wrapper).
 	if strings.Contains(body, "<html") {
 		t.Errorf("handleAdminAuditLogList returned full Layout wrapper for non-HTMX request; got <html> in body")
+	}
+}
+
+func TestDashboardPrincipalSyncControlsHandlersSurfaceErrors(t *testing.T) {
+	mux := newAuthedAdminMux(parityStoreStub{errSyncControls: errors.New("invalid sync control")})
+	tests := []struct {
+		name string
+		path string
+		htmx bool
+		want int
+	}{
+		{name: "admin full page", path: "/dashboard/admin?auth=ok", want: http.StatusServiceUnavailable},
+		{name: "admin htmx", path: "/dashboard/admin?auth=ok", htmx: true, want: http.StatusServiceUnavailable},
+		{name: "admin projects full page", path: "/dashboard/admin/projects?auth=ok", want: http.StatusServiceUnavailable},
+		{name: "admin projects htmx", path: "/dashboard/admin/projects?auth=ok", htmx: true, want: http.StatusServiceUnavailable},
+		{name: "projects list fragment", path: "/dashboard/projects/list?auth=ok", htmx: true, want: http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			if tt.htmx {
+				req.Header.Set("HX-Request", "true")
+			}
+			mux.ServeHTTP(rec, req)
+			if rec.Code != tt.want {
+				t.Fatalf("expected %d, got %d body=%q", tt.want, rec.Code, rec.Body.String())
+			}
+		})
 	}
 }

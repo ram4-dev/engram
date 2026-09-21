@@ -16,7 +16,7 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 
 | Agent         | One-liner                                                                                    | Manual Config                                      |
 | ------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| Claude Code   | `claude plugin marketplace add Gentleman-Programming/engram && claude plugin install engram` | [Details](#claude-code)                            |
+| Claude Code   | `engram setup claude-code`                                                                    | [Details](#claude-code)                            |
 | Pi            | `engram setup pi`                                                                            | [Details](#pi)                                     |
 | OpenCode      | `engram setup opencode`                                                                      | [Details](#opencode)                               |
 | Gemini CLI    | `engram setup gemini-cli`                                                                    | [Details](#gemini-cli)                             |
@@ -30,11 +30,23 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 | Kilo Code       | `engram setup kilocode`                                                                      | [Details](#kilo-code)                              |
 | Any MCP agent   | `engram mcp` (stdio)                                                                         | [Details](#any-other-mcp-agent)                    |
 
-> **Native setup for all agents above.** `engram setup <agent>` writes the right
-> MCP registration (handling each client's config format — `mcpServers`,
-> `servers`, or OpenCode's `mcp` object) plus the Memory Protocol into that
-> agent's instruction surface, idempotently. The per-agent sections below describe
-> the exact files each command touches and the manual equivalent.
+> **Native setup for all agents above.** `engram setup <agent>` configures the
+> supported MCP registration and Memory Protocol idempotently. Claude Code is the
+> exception to direct config writes: its CLI owns user-scope MCP registration. The
+> per-agent sections below describe each integration's authoritative owner and
+> manual equivalent.
+
+### Protocol verbosity
+
+`engram setup claude-code --protocol=slim` requests the slim session-start
+protocol. Slim is honored only for the `claude-code` agent; all other agents
+remain on `full`. For Claude Code, slim activates only when Engram is a clean
+tagged release at or above 1.4.0. Local `dev`, Go pseudo-version, dirty, and
+other non-release builds remain on `full`; setup persists the selection and
+warns so you can install a supported tagged release.
+Claude slim also requires plugin 0.1.1+. If setup cannot verify the enabled
+marketplace plugin, it warns without changing the selected mode; session-only
+`claude --plugin-dir ...` installs cannot be detected.
 
 ## Pi
 
@@ -44,14 +56,14 @@ Install Engram's Pi package, the MCP adapter, and Pi MCP config:
 engram setup pi
 ```
 
-`engram setup pi` runs `pi install npm:gentle-engram@0.1.8` and `pi install npm:pi-mcp-adapter`, then ensures Pi settings contain both packages and writes `mcpServers.engram` in the Pi agent MCP config when no Engram server is already configured. Existing `mcpServers.engram` entries are preserved.
+`engram setup pi` runs `pi install npm:gentle-engram@0.1.13` and `pi install npm:pi-mcp-adapter`, then ensures Pi settings contain both packages and writes `mcpServers.engram` in the Pi agent MCP config when no Engram server is already configured. Existing `mcpServers.engram` entries are preserved.
 
 When [mise](https://mise.jdx.dev/) is detected in `PATH`, `engram setup pi` also auto-pins `npmCommand` in Pi's `settings.json` to `["mise", "exec", "node@<version>", "--", "npm"]`, preventing Node version drift from silently changing which npm root Pi uses. If `npmCommand` already exists in `settings.json`, the existing value is preserved. This step is a no-op when mise is not installed.
 
 Manual equivalent:
 
 ```bash
-pi install npm:gentle-engram@0.1.8
+pi install npm:gentle-engram@0.1.13
 pi install npm:pi-mcp-adapter
 pi-engram init
 ```
@@ -72,6 +84,10 @@ ENGRAM_URL=http://127.0.0.1:7437 pi
 
 `ENGRAM_URL` tells the `gentle-engram` Pi extension to use an already-running `engram serve` instance instead of auto-starting one. This is standard shell syntax: `KEY=value command`. The URL is the HTTP REST API base; it is not an MCP endpoint.
 
+### Local server ownership
+
+Loopback reachability is not an ownership boundary. Engram stores an opaque identity in each local data directory and default-managed Claude Code, Codex, Pi, and OpenCode startups only adopt a matching local server. A different or older local server without that identity is reported instead of silently sharing memory. Set an explicit `ENGRAM_URL` to opt into an external server, or use `ENGRAM_PORT` or `ENGRAM_SOCKET` to isolate local servers.
+
 Use a custom Engram binary for MCP tools and local auto-start:
 
 ```bash
@@ -82,9 +98,13 @@ If the binary is missing, the MCP launcher exits cleanly instead of crashing Pi 
 
 ### Project auto-detection (important)
 
-`mem_save` resolves its write project in this order: validated explicit `project`, existing `session_id` association, repo `.engram/config.json`/cwd detection, then directory-basename fallback. Use an explicit `project` when you intentionally want to target a known project; invalid or unbacked names fail loudly instead of silently falling back.
+`mem_save` resolves its write project in this order: validated explicit `project`, existing `session_id` association, repo `.engram/config.json`/cwd detection, then directory-basename fallback. Automatic Git detection stores the first normalized remote/root label in private shared Git metadata, so remote renames, linked worktrees, and repository moves keep using that label. If that binding is corrupt or cannot be written, detection fails closed; set `.engram/config.json` to the intended project rather than relying on the current remote name. Global local/cloud `project_id` propagation and alias migration remain deferred. Use an explicit `project` when you intentionally want to target a known project; invalid or unbacked names fail loudly instead of silently falling back.
 
 Other write tools still primarily use cwd/repo detection unless their schema says otherwise. Start the MCP server from the repo or add `.engram/config.json` when you want deterministic default writes.
+
+OpenCode binds `mem_save`, `mem_save_prompt`, `mem_session_summary`, and `mem_capture_passive` to its confirmed top-level runtime session and maps subagents to their authoritative parent.
+
+Pi binds `mem_save`, `mem_save_prompt`, `mem_session_summary`, and `mem_capture_passive` to the exact `ctx.sessionManager.getSessionId()` runtime session. Those four wrappers ignore model-supplied session IDs, and a missing or unacknowledged runtime session fails safely instead of writing under a synthesized ID.
 
 To lock write tools to the canonical project for a repo, add `.engram/config.json` at the repo root:
 
@@ -99,6 +119,8 @@ When present, `project_name` is the default auto-detected target for writes from
 For monorepos, prefer subproject configs such as `backend/.engram/config.json` and `frontend/.engram/config.json`. Engram uses the **nearest** config under the enclosing git root, so backend/frontend can resolve as separate projects while still blocking `$HOME/.engram/config.json` ancestor leakage.
 
 **Recommended first call:** `mem_current_project` — confirms which project Engram detected before you start writing. Returns `project_source` (how it was detected) and `available_projects` (if cwd is ambiguous).
+
+**Cross-project recall:** when the detected project is empty or the wrong one, call `mem_list_projects` to enumerate every known project with counts, then scope `mem_search`/`mem_context` to the project you need. `mem_list_projects` is included in the `agent` profile, and `engram mcp` registers all tools by default — `--tools=agent` is not required.
 
 If a write tool returns `ambiguous_project`, the agent must not guess. This happens when the MCP server is started from a parent directory that contains multiple repositories, for example:
 
@@ -214,8 +236,17 @@ engram setup opencode
 This does three things:
 
 1. Copies the plugin to `~/.config/opencode/plugins/engram.ts` (session tracking, Memory Protocol, compaction recovery)
-2. Adds the `engram` MCP server entry to your `opencode.json` with `--tools=agent` (15 agent-facing tools)
+2. Adds the `engram` MCP server entry to your `opencode.json` with `--tools=agent` (19 agent-facing tools)
 3. Adds `opencode-subagent-statusline` to your `tui.json` or `tui.jsonc` so OpenCode shows sub-agent activity in the sidebar/home footer
+
+### Verify each layer after setup
+
+`engram setup opencode` confirms only that it wrote the plugin and, when no warning was printed, the OpenCode MCP registration. It cannot confirm that OpenCode connected to the server or that an already-running agent session exposes the tools.
+
+1. Restart OpenCode, then run `opencode mcp list`. Confirm that OpenCode reports the `engram` server as connected. This verifies the client/server connection, not tool exposure in an agent session.
+2. Start a **new** OpenCode agent session and confirm that it can use an `engram_mem_*` tool before relying on Engram. A connected server, HTTP health check, or successful `engram setup` does not by itself prove that tools are visible in the active agent session.
+
+If the server is connected but the new session does not expose Engram tools, restart OpenCode and create another new session. Engram cannot directly inspect or verify the tool exposure of the active OpenCode agent session.
 
 The plugin auto-starts the HTTP server if needed for session tracking. If your environment blocks background processes, run it manually:
 
@@ -225,7 +256,7 @@ engram serve &
 
 > **Windows**: OpenCode uses `~/.config/opencode/` on Windows too (it does not read `%APPDATA%\opencode\`). `engram setup opencode` writes to `~/.config/opencode/plugins/` and `~/.config/opencode/opencode.json`. To run the server in the background: `Start-Process engram -ArgumentList "serve" -WindowStyle Hidden` (PowerShell) or just run `engram serve` in a separate terminal.
 
-**Alternative: Manual MCP-only setup** (no plugin, all 19 tools by default):
+**Alternative: Manual MCP-only setup** (no plugin, all 23 tools by default):
 
 Add to your `opencode.json` (global: `~/.config/opencode/opencode.json` on all platforms, or project-level):
 
@@ -249,14 +280,14 @@ See [Plugins → OpenCode Plugin](PLUGINS.md#opencode-plugin) for details on wha
 
 > **Prerequisite**: Install the `engram` binary first (via [Homebrew](INSTALLATION.md#homebrew-macos--linux), [Windows binary](INSTALLATION.md#windows), [binary download](INSTALLATION.md#download-binary-all-platforms), or [source](INSTALLATION.md#install-from-source-macos--linux)). The plugin needs it for the MCP server and session tracking scripts.
 
-**Option A: Plugin via marketplace (recommended)** — full session management, auto-import, compaction recovery, and Memory Protocol skill:
+**Option A: Plugin via marketplace** — installs session hooks, scripts, compaction recovery, and the Memory Protocol skill:
 
 ```bash
 claude plugin marketplace add Gentleman-Programming/engram
 claude plugin install engram
 ```
 
-That's it. The plugin registers the MCP server, hooks, and Memory Protocol skill automatically.
+Marketplace installation provides plugin assets only; it does not register the MCP server.
 
 > **If the marketplace command fails with a schema error**
 >
@@ -269,32 +300,31 @@ That's it. The plugin registers the MCP server, hooks, and Memory Protocol skill
 >
 > Then re-run the marketplace command. If you cannot update for some reason, **Option C (Bare MCP)** below works on any Claude Code version because it does not go through the marketplace.
 
-**Option B: Plugin via `engram setup`** — same plugin, installed from the embedded binary:
+**Option B: Supported complete setup (required for plugin MCP)** — run after Option A, or run it alone to install or refresh the marketplace plugin and register MCP:
 
 ```bash
 engram setup claude-code
 ```
 
-During setup, Engram also attempts to write durable user-level MCP config to `~/.claude/mcp/engram.json` using the absolute `engram` binary path; if that write is not possible, setup warns and continues. You'll be asked whether to add engram's agent-profile MCP tools to `~/.claude/settings.json` `permissions.allow`. The setup writes entries for both the durable user-level MCP server id (`mcp__engram__...`) and the plugin-scoped server id used by older Claude Code plugin installs, so re-running setup repairs stale or incomplete allowlists without adding startup delay.
+The supported plugin-and-hook setup requires `jq` and `curl` on `PATH` before installation. On Windows, `curl.exe` satisfies curl detection, but `jq` must also be installed and available to the shell Claude Code uses. If those hook prerequisites are unavailable, use **Option C (Bare MCP)**, the MCP-only fallback; it does not install or run plugin hooks.
 
-**Option C: Bare MCP** — all 19 tools by default, no session management:
+`engram setup claude-code` delegates MCP registration to Claude CLI. Claude writes the user-scope top-level `mcpServers.engram` entry in `~/.claude.json` (Windows: `%USERPROFILE%\\.claude.json`); when `CLAUDE_CONFIG_DIR` is set, Claude uses `$CLAUDE_CONFIG_DIR/.claude.json`. Engram reads only that documented entry: an exact stdio command and arguments (`<absolute-engram-path> mcp --tools=agent`) is a no-op, while a missing entry is added with `claude mcp add --transport stdio --scope user engram -- <absolute-engram-path> mcp --tools=agent` and then verified. A mismatched or unreadable entry is reported as a conflict and is never overwritten. If verification fails after a proven-absent add, setup asks Claude to remove that user-scope entry and reports both errors if rollback fails. You'll be asked whether to add Engram's agent-profile MCP tools to `~/.claude/settings.json` `permissions.allow`. Existing marketplace plugin copies receive hooks, scripts, and skills updates through normal Claude Code plugin updates; do not edit the plugin cache manually.
 
-Add to your `.claude/settings.json` (project) or `~/.claude/settings.json` (global):
+`engram setup claude-code --protocol=slim` requires Engram plugin version 0.1.1 or later. Setup checks `claude plugin list --json` after a successful install and warns, without failing or changing the selected slim mode, when it cannot verify the installed enabled marketplace plugin. Update through your normal Claude Code plugin update path and restart Claude Code. Session-only `claude --plugin-dir ...` plugins cannot be detected by this check.
 
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "command": "engram",
-      "args": ["mcp"]
-    }
-  }
-}
+**Option C: Bare MCP** — all 23 tools by default, no session management:
+
+Use Claude CLI to register the user-scope server (replace the placeholder with the absolute Engram executable path):
+
+```bash
+claude mcp add --transport stdio --scope user engram -- <absolute-engram-path> mcp --tools=agent
 ```
+
+Claude rejects an existing user-scope server with the same name rather than overwriting it. To remove the registration later, run `claude mcp remove engram --scope user`.
 
 With bare MCP, add a [Surviving Compaction](#surviving-compaction-recommended) prompt to your `CLAUDE.md` so the agent remembers to use Engram after context resets.
 
-> **Windows note:** The Claude Code plugin hooks use bash scripts. On Windows, Claude Code runs hooks through Git Bash (bundled with [Git for Windows](https://gitforwindows.org/)) or WSL. The `UserPromptSubmit` hook automatically switches to a fork-light safe path under Git Bash/MSYS2: the first-prompt ToolSearch still runs, while later save-reminder checks are skipped so prompt submission does not block. If Git Bash itself is blocked by Defender/EDR, the plugin also ships `scripts/user-prompt-submit.ps1` as a native PowerShell fallback for local override/testing. **Option C (Bare MCP)** remains the no-hook fallback and works natively on Windows without any shell dependency. Windows usernames containing spaces (e.g. `C:\Users\John Doe\...`) are supported — all hook commands quote `${CLAUDE_PLUGIN_ROOT}` so the path is passed as a single argument even when it contains spaces.
+> **Windows note:** The Claude Code plugin hooks use bash scripts. On Windows, Claude Code runs hooks through Git Bash (bundled with [Git for Windows](https://gitforwindows.org/)) or WSL. The `UserPromptSubmit` hook automatically switches to a fork-light safe path under Git Bash/MSYS2: the first-prompt ToolSearch still runs, while later save-reminder checks are skipped so prompt submission does not block. If Git Bash itself is blocked by Defender/EDR, the plugin also ships `scripts/user-prompt-submit.ps1` as a native PowerShell fallback for local override/testing. That fallback applies only to `UserPromptSubmit`; the complete plugin setup still requires `jq` and `curl` for its shared Bash hooks. **Option C (Bare MCP)** remains the no-hook fallback and works natively on Windows without any shell dependency. Windows usernames containing spaces (e.g. `C:\Users\John Doe\...`) are supported — all hook commands quote `${CLAUDE_PLUGIN_ROOT}` so the path is passed as a single argument even when it contains spaces.
 
 PowerShell fallback test and local override example:
 
@@ -311,7 +341,7 @@ PowerShell fallback test and local override example:
           {
             "type": "command",
             "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"C:\\path\\to\\engram\\plugin\\claude-code\\scripts\\user-prompt-submit.ps1\"",
-            "timeout": 2
+            "timeout": 10
           }
         ]
       }
@@ -364,8 +394,8 @@ engram setup gemini-cli
 `engram setup gemini-cli` now does three things:
 
 - Registers `mcpServers.engram` in `~/.gemini/settings.json` (Windows: `%APPDATA%\gemini\settings.json`)
-- Writes `~/.gemini/system.md` with the Engram Memory Protocol (includes post-compaction recovery)
-- Ensures `~/.gemini/.env` contains `GEMINI_SYSTEM_MD=1` so Gemini actually loads that system prompt
+- Writes `~/.gemini/system.md` with the Engram Memory Protocol, including post-compaction recovery and the required `mem_session_summary` then `mem_session_end` close sequence
+- Removes a legacy `GEMINI_SYSTEM_MD` override from `~/.gemini/.env`; Gemini CLI loads `system.md` directly and the override resolves it relative to the working directory
 
 > `engram setup gemini-cli` automatically writes the full Memory Protocol to `~/.gemini/system.md`, so the agent knows exactly when to save, search, and close sessions. No additional configuration needed.
 
@@ -406,6 +436,8 @@ engram setup codex
 - Best-effort installs the Codex plugin with `codex plugin marketplace add Gentleman-Programming/engram --ref main` and `codex plugin add engram@engram`
 
 > `engram setup codex` automatically writes the full Memory Protocol to `~/.codex/engram-instructions.md` and a compaction recovery prompt to `~/.codex/engram-compact-prompt.md`. No additional configuration needed.
+
+The Codex plugin passes the exact runtime `session_id` into model context only after the server confirms registration. Startup, resume, clear, and post-compaction hooks instruct the model to reuse that binding for memory writes and retain it across compaction. Missing or failed registration never supplies an authoritative ID; the model must omit `session_id` rather than invent one. Post-compaction uses the same explicit `ENGRAM_URL` (or local `ENGRAM_PORT`) as startup.
 
 Manual alternative: add to your `~/.codex/config.toml` (Windows: `%APPDATA%\codex\config.toml`):
 
@@ -509,7 +541,7 @@ The Memory Protocol tells the agent:
 - **When to save** — after bugfixes, decisions, discoveries, config changes, patterns
 - **When to search** — reactive ("remember", "recall") + proactive (overlapping past work)
 - **Session close** — mandatory `mem_session_summary` before ending
-- **After compaction** — recover state with `mem_context`
+- **After compaction** — first persist the injected summary with `mem_session_summary`; request `mem_context` only if additional context is needed
 
 See [Surviving Compaction](#surviving-compaction-recommended) for the minimal version, or [DOCS.md](../DOCS.md#memory-protocol-full-text) for the full Memory Protocol text you can copy-paste.
 
@@ -548,11 +580,12 @@ The reliable fix is to pin the project explicitly at startup time. Both forms be
 }
 ```
 
-Both `--project=my-project` and `ENGRAM_PROJECT=my-project` set `MCPConfig.DefaultProject`, which takes precedence over cwd detection for every read and write tool for the lifetime of that MCP process.
+Both `--project=my-project` and `ENGRAM_PROJECT=my-project` set `MCPConfig.DefaultProject`, which takes precedence over cwd detection for current-project tools for the lifetime of that MCP process. Deliberately global operations keep their own omission contract.
 
-> The `--project` flag and `ENGRAM_PROJECT` env var are the same mechanism. If both are supplied, the flag wins. The value must match an existing project name in your Engram store; unknown names are rejected so typos fail loudly instead of silently creating a new project bucket.
+> The `--project` flag and `ENGRAM_PROJECT` env var are the same mechanism. If both are supplied, the flag wins. The value must be a project name, not a path. Operations that cannot establish project context reject unknown values; documented creation and recovery writes retain their creation semantics.
 
 Same pattern applies to:
+
 - WSL terminals where VS Code opens a remote window (`\\wsl$\...` paths) — the MCP server process runs inside WSL but VS Code does not forward the workspace directory as cwd.
 - CI pipelines (GitHub Actions, GitLab CI, etc.) where the agent runs in a container and the checkout path differs from the project name you use locally.
 - Any Docker-based agent host where the container cwd does not match your Engram project name.
@@ -709,13 +742,13 @@ When your agent compacts (summarizes long conversations to free context), it sta
 You have access to Engram persistent memory via MCP tools (mem_save, mem_search, mem_session_summary, etc.).
 
 - Save proactively after significant work — don't wait to be asked.
-- After any compaction or context reset, call `mem_context` to recover session state before continuing.
+- After any compaction or context reset, first persist the injected summary with `mem_session_summary`. Request `mem_context` only if additional context is needed.
 ```
 
 **For OpenCode** (agent prompt in `opencode.json`):
 
-```
-After any compaction or context reset, call mem_context to recover session state before continuing.
+```text
+After any compaction or context reset, first persist the injected summary with mem_session_summary. Request mem_context only if additional context is needed.
 Save memories proactively with mem_save after significant work.
 ```
 
@@ -727,7 +760,7 @@ Save memories proactively with mem_save after significant work.
 You have access to Engram persistent memory via MCP tools (mem_save, mem_search, mem_session_summary, etc.).
 
 - Save proactively after significant work — don't wait to be asked.
-- After any compaction or context reset, call `mem_context` to recover session state before continuing.
+- After any compaction or context reset, first persist the injected summary with `mem_session_summary`. Request `mem_context` only if additional context is needed.
 ```
 
 **For VS Code** (`Code/User/prompts/*.instructions.md` or custom instructions):
@@ -738,7 +771,7 @@ You have access to Engram persistent memory via MCP tools (mem_save, mem_search,
 You have access to Engram persistent memory via MCP tools (mem_save, mem_search, mem_session_summary, etc.).
 
 - Save proactively after significant work — don't wait to be asked.
-- After any compaction or context reset, call `mem_context` to recover session state before continuing.
+- After any compaction or context reset, first persist the injected summary with `mem_session_summary`. Request `mem_context` only if additional context is needed.
 ```
 
 **For Antigravity** (`~/.gemini/GEMINI.md` or `.agent/rules/`):
@@ -749,7 +782,7 @@ You have access to Engram persistent memory via MCP tools (mem_save, mem_search,
 You have access to Engram persistent memory via MCP tools (mem_save, mem_search, mem_session_summary, etc.).
 
 - Save proactively after significant work — don't wait to be asked.
-- After any compaction or context reset, call `mem_context` to recover session state before continuing.
+- After any compaction or context reset, first persist the injected summary with `mem_session_summary`. Request `mem_context` only if additional context is needed.
 ```
 
 **For Cursor** (`.cursor/rules/engram.mdc` or `~/.cursor/rules/engram.mdc`):
@@ -761,15 +794,15 @@ The `alwaysApply: true` frontmatter tells Cursor to load this rule in every conv
 alwaysApply: true
 ---
 
-You have access to Engram persistent memory (mem_save, mem_search, mem_context).
-Save proactively after significant work. After context resets, call mem_context to recover state.
+You have access to Engram persistent memory (mem_save, mem_search, mem_context, mem_session_summary).
+Save proactively after significant work. After context resets, first persist the injected summary with mem_session_summary. Request mem_context only if additional context is needed.
 ```
 
 **For Windsurf** (`.windsurfrules`):
 
-```
-You have access to Engram persistent memory (mem_save, mem_search, mem_context).
-Save proactively after significant work. After context resets, call mem_context to recover state.
+```text
+You have access to Engram persistent memory (mem_save, mem_search, mem_context, mem_session_summary).
+Save proactively after significant work. After context resets, first persist the injected summary with mem_session_summary. Request mem_context only if additional context is needed.
 ```
 
 This is the **nuclear option** — system prompts survive everything, including compaction. Use it when you want guaranteed agent behavior without relying on plugin hooks. It is optional for agents that have a full plugin (Claude Code, OpenCode, Gemini CLI, Codex) and required for agents that do not (VS Code, Cursor, Windsurf, Antigravity).

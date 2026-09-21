@@ -3,7 +3,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-const PACKAGE_NAME = "npm:gentle-engram@0.1.8";
+const packageMetadata = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf-8"));
+const PACKAGE_NAME = `npm:${packageMetadata.name}@${packageMetadata.version}`;
+const LEGACY_PACKAGE_NAMES = new Set([
+  "npm:gentle-engram@0.1.8",
+  "npm:gentle-engram@0.1.11",
+  "npm:gentle-engram@0.1.12",
+]);
 const MCP_ADAPTER_PACKAGE = "npm:pi-mcp-adapter";
 const HELP = `pi-engram
 
@@ -12,7 +18,7 @@ Usage:
 
 Creates Pi's Engram MCP config in the Pi agent dir and ensures pi-mcp-adapter
 is declared in settings.json. The Pi extension itself is loaded by installing
-the package with: pi install npm:gentle-engram@0.1.8
+the package with: pi install ${PACKAGE_NAME}
 `;
 
 const MCP_LAUNCHER =
@@ -45,6 +51,39 @@ function ensurePackage(settingsPath, packageName) {
     return true;
   }
   return false;
+}
+
+function ensureEngramPackage(settingsPath) {
+  const settings = readJsonObject(settingsPath);
+  const packages = Array.isArray(settings.packages) ? settings.packages : [];
+  const updatedPackages = [];
+  let hasPackage = false;
+  let changed = false;
+
+  for (const packageName of packages) {
+    if (LEGACY_PACKAGE_NAMES.has(packageName)) {
+      changed = true;
+      continue;
+    }
+    if (packageName === PACKAGE_NAME) {
+      if (hasPackage) {
+        changed = true;
+        continue;
+      }
+      hasPackage = true;
+    }
+    updatedPackages.push(packageName);
+  }
+
+  if (!hasPackage) {
+    updatedPackages.push(PACKAGE_NAME);
+    changed = true;
+  }
+  if (changed) {
+    settings.packages = updatedPackages;
+    writeJsonObject(settingsPath, settings);
+  }
+  return changed;
 }
 
 function createEngramServerConfig() {
@@ -81,7 +120,7 @@ function init() {
   const mcpPath = join(agentDir, "mcp.json");
 
   const adapterChanged = ensurePackage(settingsPath, MCP_ADAPTER_PACKAGE);
-  const packageChanged = ensurePackage(settingsPath, PACKAGE_NAME);
+  const packageChanged = ensureEngramPackage(settingsPath);
   const mcpChanged = ensureMcpConfig(mcpPath, force);
 
   console.log(`Pi agent dir: ${agentDir}`);

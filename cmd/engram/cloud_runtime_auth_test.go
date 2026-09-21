@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud/auth"
-	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/v2/internal/cloud/auth"
+	"github.com/Gentleman-Programming/engram/v2/internal/cloud/cloudstore"
 )
 
 // fakeManagedTokenHashStore is an in-memory stand-in for the narrow storage
@@ -401,7 +401,7 @@ func TestCloudRuntimeAuthenticatorRejectsPrincipalTokenMismatch(t *testing.T) {
 		principal: cloudstore.Principal{ID: "p-mismatched", Kind: cloudstore.PrincipalKindHuman, DisplayName: "Alice", Role: cloudstore.PrincipalRoleAdmin, Enabled: true},
 	})
 
-	if _, err := runtimeAuth.ResolveBearerToken(context.Background(), rawToken); !errors.Is(err, auth.ErrInvalidPrincipal) {
-		t.Fatalf("expected a token/principal ID mismatch to be rejected with auth.ErrInvalidPrincipal, got %v", err)
+	if _, err := runtimeAuth.ResolveBearerToken(context.Background(), rawToken); !errors.Is(err, auth.ErrTokenPrincipalMismatch) {
+		t.Fatalf("expected a token/principal ID mismatch to be rejected with auth.ErrTokenPrincipalMismatch, got %v", err)
 	}
 }
