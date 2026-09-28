@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Engram — SessionStart hook for Codex
 #
 # 1. Ensures the engram server is running
@@ -7,7 +7,16 @@
 # 4. Injects Memory Protocol instructions + memory context
 
 ENGRAM_PORT="${ENGRAM_PORT:-7437}"
-ENGRAM_URL="http://127.0.0.1:${ENGRAM_PORT}"
+ENGRAM_EXTERNAL_URL="${ENGRAM_URL:-}"
+ENGRAM_EXTERNAL_URL="${ENGRAM_EXTERNAL_URL#"${ENGRAM_EXTERNAL_URL%%[![:space:]]*}"}"
+ENGRAM_EXTERNAL_URL="${ENGRAM_EXTERNAL_URL%"${ENGRAM_EXTERNAL_URL##*[![:space:]]}"}"
+if [ -n "$ENGRAM_EXTERNAL_URL" ]; then
+  ENGRAM_URL="$ENGRAM_EXTERNAL_URL"
+  ENGRAM_MANAGED_LOCAL=0
+else
+  ENGRAM_URL="http://127.0.0.1:${ENGRAM_PORT}"
+  ENGRAM_MANAGED_LOCAL=1
+fi
 IMPORT_TIMEOUT_SECS=8
 LOCK_TTL_SECS=$((IMPORT_TIMEOUT_SECS + 4))
 LOCK_METADATA_STALE_SECS=$((LOCK_TTL_SECS * 5))
@@ -18,36 +27,34 @@ source "${SCRIPT_DIR}/_helpers.sh"
 
 # Read hook input from stdin
 INPUT=$(cat)
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-OLD_PROJECT=$(basename "$CWD" | tr '[:upper:]' '[:lower:]')
-PROJECT=$(detect_project "$CWD")
 
-# Ensure engram server is running
-if ! curl -sf "${ENGRAM_URL}/health" --max-time 1 > /dev/null 2>&1; then
-  engram serve &>/dev/null &
+# Explicit ENGRAM_URL intentionally delegates ownership to an external server.
+if [ "$ENGRAM_MANAGED_LOCAL" = 1 ]; then
+  ENGRAM_INSTANCE_ID=$(engram instance-id 2>/dev/null) || {
+    printf '%s\n' "warning: Engram could not resolve its local server identity." >&2
+    exit 0
+  }
+if ! engram_health_matches_instance "$ENGRAM_INSTANCE_ID"; then
+  ENGRAM_SERVE_DATA_DIR="${ENGRAM_DATA_DIR:-$HOME/.engram}"
+  if mkdir -p "$ENGRAM_SERVE_DATA_DIR" 2>/dev/null && : >> "$ENGRAM_SERVE_DATA_DIR/serve.err.log" 2>/dev/null; then
+    ENGRAM_SERVE_ERR_LOG="$ENGRAM_SERVE_DATA_DIR/serve.err.log"
+  else
+    ENGRAM_SERVE_ERR_LOG="${TMPDIR:-/tmp}/engram-serve.err.log"
+  fi
+  ENGRAM_CLOUD_AUTOSYNC=1 engram serve > /dev/null 2>> "$ENGRAM_SERVE_ERR_LOG" &
   sleep 0.5
 fi
-
-# Migrate project name if it changed (one-time, idempotent)
-if [ "$OLD_PROJECT" != "$PROJECT" ] && [ -n "$OLD_PROJECT" ] && [ -n "$PROJECT" ]; then
-  curl -sf "${ENGRAM_URL}/projects/migrate" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n --arg old "$OLD_PROJECT" --arg new "$PROJECT" \
-      '{old_project: $old, new_project: $new}')" \
-    > /dev/null 2>&1
+if ! engram_health_matches_instance "$ENGRAM_INSTANCE_ID"; then
+  printf '%s\n' "warning: Engram server ownership mismatch; use ENGRAM_URL, ENGRAM_PORT, or ENGRAM_SOCKET to isolate it." >&2
+  exit 0
+fi
 fi
 
-# Create session
-if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ]; then
-  curl -sf "${ENGRAM_URL}/sessions" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n --arg id "$SESSION_ID" --arg project "$PROJECT" --arg dir "$CWD" \
-      '{id: $id, project: $project, directory: $dir}')" \
-    > /dev/null 2>&1
-fi
+PROJECT=$(resolve_project "$CWD") || PROJECT=""
+
+# Register and retain only the server-confirmed runtime identity.
+SESSION_HANDOFF=$(engram_session_handoff "$INPUT" "$PROJECT" "$CWD")
 
 # Auto-import git-synced chunks
 if [ -f "${CWD}/.engram/manifest.json" ]; then
@@ -134,19 +141,23 @@ if [ -f "${CWD}/.engram/manifest.json" ]; then
 fi
 
 # Fetch memory context
-ENCODED_PROJECT=$(printf '%s' "$PROJECT" | jq -sRr @uri)
-CONTEXT=$(curl -sf "${ENGRAM_URL}/context?project=${ENCODED_PROJECT}" --max-time 3 2>/dev/null | jq -r '.context // empty')
+CONTEXT=""
+if [ -n "$PROJECT" ]; then
+  ENCODED_PROJECT=$(printf '%s' "$PROJECT" | jq -sRr @uri)
+  CONTEXT=$(curl -sf "${ENGRAM_URL}/context?project=${ENCODED_PROJECT}" --max-time 3 2>/dev/null | jq -r '.context // empty')
+fi
 
 # Inject Memory Protocol + context — stdout is returned to Codex as additionalContext
+printf '%s\n' "$SESSION_HANDOFF"
 cat <<'PROTOCOL'
 ## Engram Persistent Memory — ACTIVE PROTOCOL
 
 You have engram memory tools. This protocol is MANDATORY and ALWAYS ACTIVE.
 
 ### CORE TOOLS — always available, no ToolSearch needed
-mem_save, mem_search, mem_context, mem_session_summary, mem_get_observation, mem_save_prompt
+mem_save, mem_search, mem_context, mem_session_summary, mem_get_observation, mem_save_prompt, mem_current_project, mem_judge, mem_compare
 
-Use ToolSearch for other tools: mem_update, mem_suggest_topic_key, mem_session_start, mem_session_end, mem_stats, mem_delete, mem_timeline, mem_capture_passive
+Use ToolSearch for other tools: mem_update, mem_review, mem_pin, mem_unpin, mem_suggest_topic_key, mem_session_start, mem_session_end, mem_doctor, mem_capture_passive
 
 ### PROACTIVE SAVE — do NOT wait for user to ask
 Call `mem_save` IMMEDIATELY after ANY of these:
@@ -163,6 +174,9 @@ Call `mem_save` IMMEDIATELY after ANY of these:
 - Discussion concludes with a clear direction chosen
 
 **Self-check after EVERY task**: "Did I or the user just make a decision, confirm a recommendation, express a preference, fix a bug, learn something, or establish a convention? If yes → mem_save NOW."
+
+### DELIVERY GUARANTEE
+Memory operations are internal bookkeeping, never the user-facing answer. Complete required memory work before composing the completed-task reply; send the complete answer as the final message of the turn with no later tool calls. If memory work fails or needs follow-up, still send the answer.
 
 ### SEARCH MEMORY when:
 - User asks to recall anything ("remember", "what did we do", or the equivalent in the user's language)

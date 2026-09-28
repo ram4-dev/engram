@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Engram — UserPromptSubmit hook for Codex
 #
 # On the FIRST message of a session: injects a ToolSearch instruction to force
 # Codex to load all engram memory tools (which are deferred by default).
 #
 # On subsequent messages: checks when the last mem_save was for the current
-# project. If it's been > 15 minutes AND the session has been active > 5
+# project. If it's been at least 15 minutes AND the session has been active > 5
 # minutes, injects a nudge reminding the agent to save.
 #
 # The nudge is debounced per session: once shown, it stays quiet for
@@ -28,23 +28,25 @@ source "${SCRIPT_DIR}/_helpers.sh"
 INPUT=$(cat)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+PROJECT=""
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROMPT PERSIST
 #
 # Every user message is captured to POST /prompts so mem_save can attach the
-# originating prompt via SessionActivity. Detached subshell: never blocks and
+# originating prompt via SessionActivity. The canonical project is resolved by
+# the server before this script writes. Detached subshell: never blocks and
 # never fails the hook.
 # ──────────────────────────────────────────────────────────────────────────────
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty')
 if [ -n "$PROMPT" ] && [ -n "$SESSION_ID" ]; then
   (
-    _PROMPT_PROJECT=$(detect_project "$CWD")
+    PROJECT=$(resolve_project "$CWD") || exit 0
     curl -sf -X POST "${ENGRAM_URL}/prompts" --max-time 2 \
       -H 'Content-Type: application/json' \
-      -d "$(jq -n --arg s "$SESSION_ID" --arg p "${_PROMPT_PROJECT:-}" --arg c "$PROMPT" \
+      -d "$(jq -n --arg s "$SESSION_ID" --arg p "$PROJECT" --arg c "$PROMPT" \
             '{session_id:$s, project:$p, content:$c}')" >/dev/null 2>&1 || true
-  ) &
+  ) </dev/null >/dev/null 2>&1 &
 fi
 
 parse_epoch() {
@@ -79,9 +81,14 @@ parse_epoch() {
     date -j -u -f "%Y-%m-%dT%H:%M:%S" "$Z_TS" "+%s" 2>/dev/null && return 0
   fi
 
-  date -j -f "%Y-%m-%dT%H:%M:%S" "$TS" "+%s" 2>/dev/null \
-    || date -j -f "%Y-%m-%d %H:%M:%S" "$TS" "+%s" 2>/dev/null \
-    || date -d "$TS" "+%s" 2>/dev/null
+  # No timezone marker at all — these are naive timestamps from sqlite's
+  # datetime('now'), which is always UTC. Must parse with -u; parsing as
+  # local time skews the result by the host's UTC offset (e.g. on a UTC-6
+  # host, session age comes out ~6h in the future, so it's always seen as
+  # "just started" and the save-nudge can never fire).
+  date -j -u -f "%Y-%m-%dT%H:%M:%S" "$TS" "+%s" 2>/dev/null \
+    || date -j -u -f "%Y-%m-%d %H:%M:%S" "$TS" "+%s" 2>/dev/null \
+    || date -u -d "$TS" "+%s" 2>/dev/null
 }
 
 # Default: no injection
@@ -94,14 +101,11 @@ OUTPUT="{}"
 # State file lives in /tmp and is keyed by session_id (falls back to project+pid).
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Build a stable session key — prefer SESSION_ID, fall back to project name
+# Build a stable session key — prefer SESSION_ID, then a process-local fallback.
 if [ -n "$SESSION_ID" ]; then
   SESSION_KEY="engram-codex-${SESSION_ID}-tools-loaded"
 else
-  # No session ID available — only then detect project for the fallback state key.
-  PROJECT=$(detect_project "$CWD")
-  SAFE_PROJECT=$(printf '%s' "${PROJECT:-unknown}" | tr -cs 'a-zA-Z0-9_-' '_')
-  SESSION_KEY="engram-codex-${SAFE_PROJECT}-$$-tools-loaded"
+  SESSION_KEY="engram-codex-unknown-$$-tools-loaded"
 fi
 
 STATE_FILE="/tmp/${SESSION_KEY}"
@@ -120,9 +124,9 @@ fi
 # SUBSEQUENT MESSAGES — save-nudge logic
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Detect project only after the first-message path has had a chance to return.
+# Resolve the project only after the first-message path has had a chance to return.
 if [ -z "${PROJECT:-}" ]; then
-  PROJECT=$(detect_project "$CWD")
+  PROJECT=$(resolve_project "$CWD") || PROJECT=""
 fi
 
 # Bail early if we can't determine the project
@@ -167,26 +171,41 @@ if [ -z "$LAST_SAVE_JSON" ]; then
   exit 0
 fi
 
-LAST_SAVE_AT=$(echo "$LAST_SAVE_JSON" | jq -r '.[0].created_at // empty' 2>/dev/null)
-
-if [ -z "$LAST_SAVE_AT" ]; then
-  # No observations yet — no nudge (session might just be starting)
+if ! echo "$LAST_SAVE_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  # A successful HTTP response still must be a valid observations array.
   echo "$OUTPUT"
   exit 0
 fi
 
-# Parse last save timestamp and compare to now
-LAST_EPOCH=$(parse_epoch "$LAST_SAVE_AT")
-if [ -z "$LAST_EPOCH" ]; then
-  echo "$OUTPUT"
-  exit 0
-fi
 NOW_EPOCH=$(date "+%s")
-ELAPSED=$(( NOW_EPOCH - LAST_EPOCH ))
 
-# Nudge if last save was > 15 minutes ago (900 seconds), but debounce so we do
+if [ "$(echo "$LAST_SAVE_JSON" | jq 'length')" -eq 0 ]; then
+  # No observations exist yet. Use the real session age so the first-save
+  # reminder observes the same 15-minute threshold as existing saves.
+  if [ -z "${SESSION_AGE_SECS:-}" ]; then
+    echo "$OUTPUT"
+    exit 0
+  fi
+  ELAPSED="$SESSION_AGE_SECS"
+else
+  LAST_SAVE_AT=$(echo "$LAST_SAVE_JSON" | jq -r '.[0].created_at | if type == "string" then . else empty end')
+  if [ -z "$LAST_SAVE_AT" ]; then
+    # A non-empty response without a timestamp is incomplete, not a first save.
+    echo "$OUTPUT"
+    exit 0
+  fi
+  # Parse last save timestamp and compare to now
+  LAST_EPOCH=$(parse_epoch "$LAST_SAVE_AT")
+  if [ -z "$LAST_EPOCH" ]; then
+    echo "$OUTPUT"
+    exit 0
+  fi
+  ELAPSED=$(( NOW_EPOCH - LAST_EPOCH ))
+fi
+
+# Nudge if the last save was at least 15 minutes ago (900 seconds), but debounce so we do
 # not repeat the reminder on every message while the agent has nothing to save.
-if [ "$ELAPSED" -gt 900 ]; then
+if [ "$ELAPSED" -ge 900 ]; then
   NUDGE_COOLDOWN="${ENGRAM_NUDGE_COOLDOWN_SECS:-900}"
   NUDGE_STATE_FILE="${STATE_FILE%-tools-loaded}-last-nudge"
 
@@ -202,7 +221,7 @@ if [ "$ELAPSED" -gt 900 ]; then
   if [ -z "$LAST_NUDGE_EPOCH" ] || [ "$(( NOW_EPOCH - LAST_NUDGE_EPOCH ))" -ge "$NUDGE_COOLDOWN" ]; then
     printf '%s' "$NOW_EPOCH" > "$NUDGE_STATE_FILE" 2>/dev/null || true
     OUTPUT=$(jq -n \
-      '{"systemMessage": "MEMORY REMINDER: It'\''s been over 15 minutes since your last save. If you'\''ve made decisions, discoveries, or completed significant work, call mem_save now."}')
+      '{"systemMessage": "MEMORY REMINDER: It'\''s been at least 15 minutes since your last save. If you'\''ve made decisions, discoveries, or completed significant work, call mem_save now."}')
   fi
 fi
 
