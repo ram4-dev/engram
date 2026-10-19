@@ -1,6 +1,6 @@
 {
   "name": "gentle-engram",
-  "version": "0.1.10",
+  "version": "0.4.2",
   "description": "Persistent memory for Pi agents — one local-or-cloud brain shared across sessions, compactions, and MCP agents",
   "type": "module",
   "license": "MIT",
@@ -33,6 +33,9 @@
     "coding-agent",
     "extension"
   ],
+  "engram": {
+    "startupPolicy": 1
+  },
   "pi": {
     "image": "https://raw.githubusercontent.com/Gentleman-Programming/engram/main/plugin/pi/assets/engram-logo-only.png",
     "extensions": [
@@ -55,16 +58,16 @@
     "provenance": true,
     "access": "public"
   },
-  "dependencies": {
-    "@earendil-works/pi-tui": "^0.74.0",
-    "typebox": "^1.1.38"
-  },
   "peerDependencies": {
+    "typebox": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "pi-mcp-adapter": ">=2.5.0"
+    "@earendil-works/pi-tui": ">=0.74.0"
   },
   "peerDependenciesMeta": {
-    "pi-mcp-adapter": {
+    "typebox": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
       "optional": true
     }
   }
