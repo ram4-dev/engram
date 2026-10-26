@@ -141,7 +141,7 @@ The exporter only writes inside `{vault}/engram/`. It will never touch other fol
 │   │   ├── session-abc123.md
 │   │   └── session-def456.md
 │   ├── _topics/                         ← topic cluster hubs
-│   │   ├── sdd--obsidian-plugin.md
+│   │   ├── architecture--obsidian-plugin.md
 │   │   └── architecture--auth-model.md
 │   ├── engram/                          ← project folder
 │   │   ├── architecture/
@@ -167,7 +167,7 @@ id: 1719
 type: architecture
 project: engram
 scope: project
-topic_key: sdd/obsidian-plugin/explore
+topic_key: architecture/obsidian-plugin/explore
 session_id: session-abc123
 created_at: "2026-04-06T14:30:00Z"
 updated_at: "2026-04-06T14:35:00Z"
@@ -175,7 +175,7 @@ revision_count: 1
 tags:
   - engram
   - architecture
-  - sdd
+  - obsidian
 aliases:
   - "Exploration: Obsidian plugin for Engram brain visualization"
 ---
@@ -189,16 +189,20 @@ aliases:
 
 ---
 *Session*: [[session-session-abc123]]
-*Topic*: [[topic-sdd--obsidian-plugin]]
+*Topic*: [[topic-architecture--obsidian-plugin]]
 ```
 
 The wikilinks at the bottom are what give the graph view its connections. Obsidian indexes them automatically.
 
 ### Hub Notes
 
+Hub generation includes only successfully written or skipped notes, not notes whose export failed. Existing hubs remain tracked while their observations are live, even when note or hub writes fail.
+
 **Session hubs** (in `_sessions/`) — one per session, contains backlinks to every observation captured in that session. Open one to see the full chronological story of a work session.
 
-**Topic hubs** (in `_topics/`) — one per `topic_key` prefix that has ≥2 observations. Groups related work across time. For example, all `sdd/obsidian-plugin/*` observations cluster under `_topics/sdd--obsidian-plugin.md`. Singletons don't get hubs (prevents orphan clutter).
+**Topic hubs** (in `_topics/`) — one per `topic_key` prefix that has ≥2 observations. Groups related work across time. For example, all `architecture/obsidian-plugin/*` observations cluster under `_topics/architecture--obsidian-plugin.md`. Singletons don't get hubs (prevents orphan clutter).
+
+Project-scoped exports preserve existing topic hub files unchanged, because those hubs may link observations from other projects. Missing topic hubs are still created when the selected project supplies ≥2 observations for the prefix. Each attempt writes and closes its own temporary file before atomic no-replace publication, preserving any competing hub. Failed writes do not leave a partial final hub blocking retry; cleanup removes only the attempt's temporary file, never the final hub. Publication or unexpected temporary cleanup failures are reported rather than falling back to overwriting a hub. Preserved hubs are not counted as regenerated. This protects hub creation, not concurrent exports or sync-state updates as a whole. Use a full-scope export (`--all`) to regenerate topic hubs with references across projects.
 
 Slashes in topic keys become `--` in filenames for filesystem safety.
 
@@ -213,19 +217,32 @@ engram-beta obsidian-export --vault <path> [flags]
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--vault <path>` | ✅ | — | Path to your Obsidian vault root. The exporter writes inside `{vault}/engram/` only. |
-| `--project <name>` | No | (all) | Export only observations from this project. |
-| `--limit <n>` | No | 0 (no limit) | Maximum observations per source query. |
+| `--project <name>` | No | current project | Export only observations from this known project. |
+| `--all` | No | false | Explicitly export observations from every project. |
+| `--limit` | Unsupported | — | Rejected with exit code 1; omit it to export all matching observations. |
 | `--since <date>` | No | (state file) | Export only observations updated after this date. Format: RFC3339 (`2026-04-06T14:30:00Z`) or `YYYY-MM-DD`. |
 | `--force` | No | false | Re-export everything, ignoring the incremental state file. |
 | `--graph-config <mode>` | No | `preserve` | Bootstrap the Obsidian graph view config. See [Graph Config](#graph-config) below. |
 | `--watch` | No | false | Run as a daemon — exports on a fixed interval until interrupted. |
 | `--interval <duration>` | No | `10m` | Sync interval for `--watch` mode. Go duration format (`30s`, `5m`, `1h`). Minimum: `1m`. |
 
+`--limit` was previously accepted but never applied. Every explicit use now fails
+with `error: --limit is not supported by obsidian-export; omit it to export all matching observations`
+before startup update checks, configuration resolution, SQLite temporary-directory
+preparation, or database migration, including in watch mode. No store or vault is
+opened for a rejected limit. Exports without this flag remain unlimited within the
+selected project/date filters.
+Truncating reconciliation reads would risk treating unexported notes as deleted;
+a safe capped export is not implemented.
+
 ### Examples
 
 ```bash
-# Single export of everything
+# Single export of the current project
 engram-beta obsidian-export --vault ~/Obsidian/engram
+
+# Explicitly export every project
+engram-beta obsidian-export --vault ~/Obsidian/engram --all
 
 # Export only the engram project
 engram-beta obsidian-export --vault ~/Obsidian/engram --project engram
@@ -269,7 +286,11 @@ The `--watch` flag turns the export into a long-running daemon. Use cases:
 2026/04/06 23:29:29 [2026-04-06T21:29:29Z] sync: created=5 updated=2 deleted=0 skipped=1731 hubs=279
 ```
 
-Counts: how many notes were created, updated, deleted (soft-deleted obs), skipped (unchanged), and total hub notes regenerated.
+Counts: how many notes were created, updated, deleted (soft-deleted obs, hard-deleted obs, obs renamed to a new path, and session/topic hubs left with no live obs), skipped (unchanged), and total hub notes regenerated.
+
+Cleanup uses tracked paths in the sync state. Renames retire the previous note even with `--project`; `files` tracks the latest successfully written note while optional `pending_retirements` records superseded paths per observation ID, including repeated renames after failed removal. Pending removals retry after note writes; currently owned live paths are protected, including filesystem aliases such as case-only renames on case-insensitive volumes. Scoped exports retry pending paths only for IDs present in the selected project's snapshot, including soft deletes. Hard-deleted observations and orphaned hubs require a full-scope export (`--all`), because a project snapshot cannot establish ownership of absent rows. Live hubs are retained if writing their replacement fails.
+
+Cleanup cannot recover stale files whose paths were already lost from the state by an earlier export. There is no recovery scan. Existing version-1 state files without `pending_retirements` remain supported; older exporters ignore and may discard this additive field on downgrade. Keep the state file to preserve pending cleanup; `--force` or deleting the state discards that tracking.
 
 ### Running Persistent
 
@@ -356,7 +377,9 @@ You can absolutely tweak the graph view in Obsidian's UI — Engram's `preserve`
 
 ---
 
-## TypeScript Plugin (Optional)
+## HTTP Obsidian Plugin (Optional)
+
+Unlike the CLI exporter above, this plugin reads `GET /export` from a running `engram serve` instance. Each poll receives a **full snapshot**; the server does not support incremental `since` export. The plugin writes one Markdown note per observation under the configured vault subfolder (`observations/observation-<id>.md`), updating changed notes in place and leaving notes absent from later snapshots untouched. It does not generate CLI session/topic hubs or graph configuration. Set a project filter to request only that project; leave it empty to explicitly request all projects (`all_projects=true`). Scoped exports may include legacy observations with no project when their exported session belongs to the selected project. Truly foreign observations fail without writing notes or recording success. An incompatible response also fails explicitly rather than treating it as an empty export.
 
 For an in-Obsidian experience with a ribbon button, settings tab, and status bar indicator, there's a TypeScript community plugin in [`plugin/obsidian/`](https://github.com/Gentleman-Programming/engram/tree/main/plugin/obsidian).
 
@@ -396,7 +419,7 @@ In the Filter panel of Graph View:
 | `tag:#bugfix` | Constellation of every bug you've ever fixed |
 | `tag:#architecture path:engram/engram` | Architectural decisions in this project only |
 | `path:_topics` | Just the topic hubs — your "table of contents" |
-| `path:_sessions sdd` | Sessions that involved SDD work |
+| `path:_sessions architecture` | Sessions that involved architecture work |
 | `tag:#decision tag:#architecture` | Big architectural decisions |
 
 ### Navigating

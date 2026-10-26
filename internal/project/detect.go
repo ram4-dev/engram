@@ -10,10 +10,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/Gentleman-Programming/engram/v3/internal/command"
 )
 
 // ErrAmbiguousProject is returned when the working directory is a parent of
@@ -24,10 +29,13 @@ var ErrAmbiguousProject = errors.New("ambiguous project: multiple git repos foun
 // used as a project write lock.
 var ErrInvalidConfig = errors.New("invalid .engram/config.json")
 
+// ErrExplicitProjectRequired reports a HOME repository descendant needing designation.
+var ErrExplicitProjectRequired = errors.New("explicit project required: use --project, ENGRAM_PROJECT, or .engram/config.json project_name")
+
 // Source constants describe how the project name was resolved.
 const (
-	SourceGitRemote        = "git_remote"        // derived from git remote origin URL
-	SourceGitRoot          = "git_root"          // derived from git repository root basename
+	SourceGitRemote        = "git_remote"        // current repository has an origin remote; Project may come from its binding
+	SourceGitRoot          = "git_root"          // current repository has no origin remote; Project may come from its binding
 	SourceGitChild         = "git_child"         // auto-promoted from single child git repo
 	SourceDirBasename      = "dir_basename"      // fallback: directory basename
 	SourceAmbiguous        = "ambiguous"         // cwd contains multiple git repos (Case 4)
@@ -37,10 +45,44 @@ const (
 	// ErrAmbiguousProject and the caller provided an explicit user-selected
 	// project from the ambiguity result's available_projects list.
 	SourceUserSelectedAfterAmbiguousProject = "user_selected_after_ambiguous_project"
-	SourceRequestBody                       = "request_body" // REQ-414: project came from the request body (server-side, no filesystem path)
-	SourceConfig                            = "config"       // derived from .engram/config.json project_name
-	SourceAllProjects                       = "all_projects" // caller asked for cross-project search (no single project resolved)
+	SourceRequestBody                       = "request_body"     // REQ-414: project came from the request body (server-side, no filesystem path)
+	SourceConfig                            = "config"           // derived from .engram/config.json project_name
+	SourceAllProjects                       = "all_projects"     // caller asked for cross-project search (no single project resolved)
+	SourceProcessOverride                   = "process_override" // resolved from the process-level project override
+	// SourceStoredProject means the observation record itself carries the
+	// project. The read-only mem_get_observation tool falls back to
+	// it when cwd resolution fails only because the current directory is
+	// ambiguous: the integer id fully identifies the record, so its stored
+	// project is a safe anchor.
+	SourceStoredProject = "stored_project"
 )
+
+// EnvProjectOverride names the environment variable that carries the
+// process-level project override.
+const EnvProjectOverride = "ENGRAM_PROJECT"
+
+// ProcessOverride returns the single process-level project override that every
+// entry point (CLI, MCP, HTTP server) applies before working-directory
+// detection. It is the one precedence rule for process-level identity:
+//
+//  1. explicit process argument — `engram mcp --project <name>`, which the MCP
+//     server carries as MCPConfig.DefaultProject;
+//  2. the ENGRAM_PROJECT environment variable;
+//  3. no override, so the caller falls back to cwd detection.
+//
+// A request-scoped project (the CLI `engram save --project` flag or an MCP tool
+// argument) is resolved by the caller before this rule and always wins over it.
+// The returned name is trimmed but not normalized; callers normalize with
+// store.NormalizeProject so the operator still sees the normalization warning.
+func ProcessOverride(explicit string) (string, bool) {
+	if trimmed := strings.TrimSpace(explicit); trimmed != "" {
+		return trimmed, true
+	}
+	if trimmed := strings.TrimSpace(os.Getenv(EnvProjectOverride)); trimmed != "" {
+		return trimmed, true
+	}
+	return "", false
+}
 
 // noiseSet lists directory names that are skipped during child-repo scanning.
 var noiseSet = map[string]bool{
@@ -55,32 +97,86 @@ var noiseSet = map[string]bool{
 	".vscode":      true,
 }
 
+const (
+	childScanTimeout = 200 * time.Millisecond
+)
+
+// childScanNow and childScanReadDir are test seams for bounded child scans.
+// Production uses the wall clock and synchronous directory reads, so it never
+// starts a goroutine that could outlive a blocked filesystem operation.
+var (
+	childScanNow     = time.Now
+	childScanReadDir = func(directory *os.File, count int) ([]os.DirEntry, error) {
+		return directory.ReadDir(count)
+	}
+)
+
 // DetectionResult carries the full output of DetectProjectFull.
 type DetectionResult struct {
-	// Project is the resolved project name. Empty when Error==ErrAmbiguousProject.
+	// Project is the resolved project name. Empty when detection returns an error.
 	Project string
-	// Source describes how the project name was derived.
+	// Source describes the resolution path. For Git projects, it reflects current
+	// origin-remote presence while Project may come from the stored binding.
 	Source string
 	// Path is the canonical directory associated with the project
 	// (repo root for git cases, input dir for dir_basename).
 	Path string
 	// Warning is a non-empty advisory message when Source==SourceGitChild.
 	Warning string
-	// Error is non-nil only for ErrAmbiguousProject.
+	// Error is non-nil when detection cannot safely resolve a project.
 	Error error
 	// AvailableProjects is populated only when Error==ErrAmbiguousProject.
 	AvailableProjects []string
 }
 
-// DetectProjectFull resolves the project for dir using a 5-case algorithm:
+// DetectProjectFull resolves the project for dir using a 6-case algorithm:
 //
 //  0. config     — nearest .engram/config.json inside the enclosing repo/root
-//  1. git_remote — cwd is a git root with a remote → derive name from remote URL
-//  2. git_root   — cwd is inside a git repo → use repo root basename
-//  3. git_child  — cwd has exactly one git-repo child → auto-promote it
+//  1. git_remote — Git repo currently has origin: initialize an absent private binding from the remote name; otherwise reuse it
+//  2. git_root   — Git repo currently has no origin: initialize an absent private binding from the root basename; otherwise reuse it
+//  3. git_child  — cwd has exactly one git-repo child → resolve its canonical identity and auto-promote it
 //  4. ambiguous  — cwd has multiple git-repo children → return ErrAmbiguousProject
 //  5. dir_basename — none of the above → use filepath.Base(dir)
+//
+// DetectionOptions supplies local history only when establishing a Git binding.
+// InspectOnly never initializes a binding; an unbound candidate is not authority.
+type DetectionOptions struct {
+	// Context optionally bounds an inspection and its Git subprocesses. Nil preserves ordinary detection.
+	Context       context.Context
+	HistoryLookup func(string) ([]string, error)
+	InspectOnly   bool
+	// RequireExplicitHomeProject opts captures into HOME descendant validation.
+	RequireExplicitHomeProject bool
+}
+
 func DetectProjectFull(dir string) DetectionResult {
+	return DetectProjectFullWithOptions(dir, DetectionOptions{})
+}
+
+func DetectProjectFullWithOptions(dir string, options DetectionOptions) DetectionResult {
+	ctx := options.detectionContext()
+	if err := ctx.Err(); err != nil {
+		return DetectionResult{Error: err}
+	}
+	result := detectProjectFull(dir, options, DirectoryIdentity(dir))
+	if err := ctx.Err(); err != nil {
+		return DetectionResult{Error: err}
+	}
+	return result
+}
+
+func (options DetectionOptions) detectionContext() context.Context {
+	if options.Context != nil {
+		return options.Context
+	}
+	return context.Background()
+}
+
+func detectProjectFull(dir string, options DetectionOptions, historyDirectory string) DetectionResult {
+	ctx := options.detectionContext()
+	if err := ctx.Err(); err != nil {
+		return DetectionResult{Error: err}
+	}
 	if dir == "" {
 		dir = "."
 	}
@@ -89,63 +185,53 @@ func DetectProjectFull(dir string) DetectionResult {
 		dir = "./" + dir
 	}
 
-	if res, ok := detectFromConfig(dir); ok {
+	if res, ok := detectFromConfigContext(ctx, dir); ok {
 		return res
 	}
 
-	// ── Case 1: git_remote ──────────────────────────────────────────────
-	if name := detectFromGitRemote(dir); name != "" {
-		// JS2: use repo root as Path for consistency with Case 2 (git_root).
-		// When called from a subdir, both cases should set Path to the root.
-		path := detectGitRootDir(dir)
-		if path == "" {
-			// Fallback: should not happen if detectFromGitRemote succeeded, but be safe.
-			path, _ = filepath.Abs(dir)
-		}
-		return DetectionResult{
-			Project: normalize(name),
-			Source:  SourceGitRemote,
-			Path:    path,
-		}
-	}
-
-	// ── Case 2: git_root (includes subdir case) ─────────────────────────
-	if root := detectGitRootDir(dir); root != "" {
-		return DetectionResult{
-			Project: normalize(filepath.Base(root)),
-			Source:  SourceGitRoot,
-			Path:    root,
-		}
+	// ── Cases 1 & 2: Git repository binding ─────────────────────────────
+	if res, ok := detectFromGitBinding(dir, options, historyDirectory); ok {
+		return res
 	}
 
 	// ── Cases 3 & 4: scan child directories ────────────────────────────
-	children, timedOut := scanChildren(dir)
+	children, timedOut := scanChildrenContext(ctx, dir)
+	if err := ctx.Err(); err != nil {
+		return DetectionResult{Error: err}
+	}
 	if timedOut {
-		// Fall through to dir_basename (Case 5).
+		if options.InspectOnly && options.Context != nil {
+			// A bounded client inspection cannot treat an incomplete scan as identity.
+			return DetectionResult{Error: context.DeadlineExceeded}
+		}
+		// Ordinary callers retain the existing basename fallback.
 		goto basename
 	}
 	switch len(children) {
 	case 1:
 		// Case 3: exactly one child repo — auto-promote.
 		child := children[0]
-		childName := normalize(filepath.Base(child))
-		absChild, _ := filepath.Abs(child)
+		childResult := detectProjectFull(child, options, historyDirectory)
+		if childResult.Error != nil {
+			return childResult
+		}
 		return DetectionResult{
-			Project: childName,
+			Project: childResult.Project,
 			Source:  SourceGitChild,
-			Path:    absChild,
-			Warning: "auto-promoted child repository: " + childName,
+			Path:    childResult.Path,
+			Warning: "auto-promoted child repository: " + childResult.Project,
 		}
 	default:
 		if len(children) > 1 {
 			// Case 4: multiple children → ambiguous.
 			names := make([]string, len(children))
 			for i, c := range children {
-				names[i] = normalize(filepath.Base(c))
+				names[i] = normalizeAvailableProject(filepath.Base(c))
 			}
+			slices.Sort(names)
 			absDir, _ := filepath.Abs(dir)
 			// REQ-304: Project is empty on ambiguous (spec is authoritative).
-			// DetectProject wrapper handles CLI compat by using filepath.Base on error.
+			// Consumers retain the error rather than inventing a basename identity.
 			// JW3: use SourceAmbiguous (not SourceDirBasename) to avoid misleading consumers.
 			return DetectionResult{
 				Project:           "",
@@ -160,22 +246,134 @@ func DetectProjectFull(dir string) DetectionResult {
 basename:
 	// ── Case 5: dir_basename ─────────────────────────────────────────────
 	absDir, _ := filepath.Abs(dir)
-	base := filepath.Base(dir)
-	if base == "" || base == "." {
-		base = "unknown"
-	}
 	return DetectionResult{
-		Project: normalize(base),
+		Project: fallbackProjectName(dir),
 		Source:  SourceDirBasename,
 		Path:    absDir,
 	}
+}
+
+// detectFromGitBinding preserves the first legacy Git-derived project label in
+// the repository's shared Git metadata. The binding is private to a clone and
+// shared by linked worktrees; mutable remotes are only consulted at creation.
+func detectFromGitBinding(dir string, options DetectionOptions, historyDirectory string) (DetectionResult, bool) {
+	ctx := options.detectionContext()
+	var commonDir string
+	if options.Context == nil {
+		commonDir = detectGitCommonDir(dir)
+	} else {
+		commonDir = detectGitCommonDirContext(ctx, dir)
+	}
+	if commonDir == "" {
+		return DetectionResult{}, false
+	}
+	root := detectGitRootDirContext(ctx, dir)
+	if root == "" {
+		return DetectionResult{
+			Source: SourceGitRoot,
+			Error:  fmt.Errorf("%w: cannot determine the repository root; configure project_name explicitly", ErrRepositoryBinding),
+		}, true
+	}
+
+	if options.RequireExplicitHomeProject {
+		if err := requireHomeProjectContext(ctx, dir, root); err != nil {
+			return DetectionResult{Path: root, Error: err}, true
+		}
+	}
+
+	legacyProject := normalize(filepath.Base(root))
+	source := SourceGitRoot
+	var remote string
+	if options.Context == nil {
+		remote = detectFromGitRemote(dir)
+	} else {
+		remote = detectFromGitRemoteContext(ctx, dir)
+	}
+	if remote != "" {
+		legacyProject = normalize(remote)
+		source = SourceGitRemote
+	}
+	binding, err := readRepositoryBinding(commonDir)
+	if errors.Is(err, os.ErrNotExist) {
+		if options.HistoryLookup != nil {
+			history, lookupErr := options.HistoryLookup(historyDirectory)
+			if lookupErr != nil {
+				return DetectionResult{Source: source, Path: root, Error: fmt.Errorf("%w: %v", ErrProjectHistoryUnavailable, lookupErr)}, true
+			}
+			for _, previous := range history {
+				if previous != legacyProject {
+					choices := append([]string{legacyProject}, history...)
+					slices.Sort(choices)
+					return DetectionResult{Source: source, Path: root, AvailableProjects: slices.Compact(choices), Error: &ProjectTransitionError{Candidate: legacyProject, HistoricalProjects: history}}, true
+				}
+			}
+		}
+		if options.InspectOnly {
+			return DetectionResult{Project: legacyProject, Source: SourceUnboundGit, Path: root}, true
+		}
+		// The history lookup is a snapshot, not a transaction across stores and
+		// Git metadata. Atomic publication still accepts an established winner.
+		if err := ctx.Err(); err != nil {
+			return DetectionResult{Error: err}, true
+		}
+		binding, err = loadOrCreateRepositoryBinding(commonDir, legacyProject)
+	}
+	if err != nil {
+		return DetectionResult{Source: source, Path: root, Error: err}, true
+	}
+	return DetectionResult{Project: binding.Project, Source: source, Path: root}, true
+}
+
+// requireHomeProject runs before history lookup or private binding publication.
+// Query only the requested subtree; an unreadable index is not an empty index.
+func requireHomeProjectContext(parent context.Context, dir, root string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("cannot determine HOME for project selection: %w", err)
+	}
+	home = DirectoryIdentity(home)
+	if DirectoryIdentity(root) != home {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	// Linked worktrees retain their own checkout boundary, even when their
+	// shared identity root is HOME. Failure to establish it must fail closed.
+	checkout, err := command.NewContext(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return fmt.Errorf("cannot verify HOME checkout for project selection: %w", err)
+	}
+	if DirectoryIdentity(strings.TrimSpace(string(checkout))) != home {
+		return nil
+	}
+	cwd := DirectoryIdentity(dir)
+	relative, err := filepath.Rel(home, cwd)
+	if err != nil {
+		return fmt.Errorf("cannot compare HOME project directory: %w", err)
+	}
+	if relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return nil
+	}
+	// '.' is relative to -C's cwd and cannot interpret directory-name globbing.
+	cmd := command.NewContext(ctx, "git", "-C", dir, "ls-files", "--cached", "-z", "--", ".")
+	tracked, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("cannot verify tracked files for HOME project selection; configure project_name explicitly: %w", err)
+	}
+	if len(tracked) == 0 {
+		return ErrExplicitProjectRequired
+	}
+	return nil
 }
 
 type configFile struct {
 	ProjectName string `json:"project_name"`
 }
 
-func detectFromConfig(dir string) (DetectionResult, bool) {
+func detectFromConfigContext(ctx context.Context, dir string) (DetectionResult, bool) {
+	if err := ctx.Err(); err != nil {
+		return DetectionResult{Error: err}, true
+	}
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		absDir = dir
@@ -186,8 +384,8 @@ func detectFromConfig(dir string) (DetectionResult, bool) {
 	// cwd is inside git, walk upward only within the enclosing repository so a
 	// nearest subproject .engram/config.json can override the repo root without
 	// letting ~/.engram/config.json leak into nested workspaces under $HOME.
-	if gitRoot := canonicalizePath(detectGitRootDir(absDir)); gitRoot != "" {
-		return readNearestConfigAtOrBelow(absDir, gitRoot)
+	if worktreeRoot := canonicalizePath(detectGitWorktreeDirContext(ctx, absDir)); worktreeRoot != "" {
+		return readNearestConfigAtOrBelowContext(ctx, absDir, worktreeRoot)
 	}
 
 	// Outside git, accept only the current directory's config. Do not walk to
@@ -195,11 +393,14 @@ func detectFromConfig(dir string) (DetectionResult, bool) {
 	return readConfigAt(absDir)
 }
 
-func readNearestConfigAtOrBelow(startDir, stopDir string) (DetectionResult, bool) {
+func readNearestConfigAtOrBelowContext(ctx context.Context, startDir, stopDir string) (DetectionResult, bool) {
 	current := filepath.Clean(startDir)
 	stop := filepath.Clean(stopDir)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return DetectionResult{Error: err}, true
+		}
 		if res, ok := readConfigAt(current); ok {
 			return res, true
 		}
@@ -257,6 +458,41 @@ func canonicalizePath(path string) string {
 	return filepath.Clean(resolved)
 }
 
+// RuntimeWorktreeDirectory returns the stable directory identity for runtime
+// session binding. Unlike DetectProjectFull's Path, linked worktrees retain
+// their individual checkout roots while their project identity may remain
+// shared with the primary checkout.
+func RuntimeWorktreeDirectory(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		dir = "."
+	}
+	if absolute, err := filepath.Abs(dir); err == nil {
+		dir = absolute
+	}
+	if worktreeRoot := detectGitWorktreeDir(dir); worktreeRoot != "" {
+		return runtimeCanonicalizePath(worktreeRoot)
+	}
+	return runtimeCanonicalizePath(dir)
+}
+
+// DirectoryIdentity compares exact directories without promoting them to a
+// repository root. Historical subdirectories and worktrees remain distinct.
+func DirectoryIdentity(path string) string {
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	return runtimeCanonicalizePath(path)
+}
+
+func runtimeCanonicalizePath(path string) string {
+	path = canonicalizePath(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(path)
+	}
+	return path
+}
+
 func normalizeConfigProjectName(projectName string) (string, error) {
 	trimmed := strings.TrimSpace(projectName)
 	if trimmed == "" {
@@ -273,40 +509,117 @@ func normalizeConfigProjectName(projectName string) (string, error) {
 	return normalize(trimmed), nil
 }
 
-// detectGitRootDir returns the git repository root for dir, or "" if not in a repo.
+// detectGitRootDir returns the canonical repository root for dir, or "" if it is
+// not in a repository. Linked worktrees share this root with their primary checkout.
 func detectGitRootDir(dir string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	return detectGitRootDirContext(context.Background(), dir)
+}
+
+func detectGitRootDirContext(parent context.Context, dir string) string {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
 
-	cmd := newProjectCommandContext(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel")
+	commonDir := gitRevParsePath(ctx, dir, "--git-common-dir")
+	if commonDir == "" {
+		return ""
+	}
+
+	worktreeDir := gitRevParsePath(ctx, dir, "--show-toplevel")
+	if worktreeDir != "" {
+		// Ordinary repositories and submodules have the same git and common
+		// directories, so their checkout root is authoritative. A linked
+		// worktree has a per-worktree git directory and must retain the shared
+		// primary root derived from git-common-dir.
+		if gitDir := gitRevParsePath(ctx, dir, "--git-dir"); gitDir == commonDir {
+			return worktreeDir
+		}
+	}
+	return repositoryRootFromCommonDir(commonDir)
+}
+
+func detectGitCommonDir(dir string) string {
+	return detectGitCommonDirContext(context.Background(), dir)
+}
+
+func detectGitCommonDirContext(parent context.Context, dir string) string {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	return gitRevParsePath(ctx, dir, "--git-common-dir")
+}
+
+func gitRevParsePath(ctx context.Context, dir, argument string) string {
+	cmd := command.NewContext(ctx, "git", "-C", dir, "rev-parse", "--path-format=absolute", argument)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
-	root := strings.TrimSpace(string(out))
-	return root
+	path := filepath.Clean(strings.TrimSpace(string(out)))
+	if path == "." || path == "" {
+		return ""
+	}
+	return path
 }
 
-// scanChildren scans dir at depth=1 for git repositories, skipping noise dirs,
-// hidden dirs, enforcing a 200ms timeout, a 20-entry cap, and short-circuiting
-// as soon as more than 1 repo is found.
-// Returns the list of found git-repo paths and a boolean indicating timeout.
-func scanChildren(dir string) (repos []string, timedOut bool) {
-	deadline := time.Now().Add(200 * time.Millisecond)
+func repositoryRootFromCommonDir(commonDir string) string {
+	if filepath.Base(commonDir) == ".git" {
+		return filepath.Dir(commonDir)
+	}
+	return strings.TrimSuffix(commonDir, ".git")
+}
 
-	entries, err := os.ReadDir(dir)
+// detectGitWorktreeDir returns the current checkout root for dir. Config files
+// are scoped to that checkout rather than the shared repository identity root.
+func detectGitWorktreeDir(dir string) string {
+	return detectGitWorktreeDirContext(context.Background(), dir)
+}
+
+func detectGitWorktreeDirContext(parent context.Context, dir string) string {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+
+	cmd := command.NewContext(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// scanChildrenContext scans dir at depth=1 for git repositories, skipping noise dirs,
+// hidden dirs, enforcing a 200ms timeout, and
+// short-circuiting as soon as more than one repository is found.
+// Returns the list of found git-repo paths and a boolean indicating timeout.
+func scanChildrenContext(ctx context.Context, dir string) (repos []string, timedOut bool) {
+	deadline := childScanNow().Add(childScanTimeout)
+	directory, err := os.Open(dir)
 	if err != nil {
 		return nil, false
 	}
+	defer directory.Close()
+	if ctx.Err() != nil || childScanNow().After(deadline) {
+		return nil, true
+	}
 
-	scanned := 0
-	for _, entry := range entries {
-		if time.Now().After(deadline) {
+	for {
+		// Check before each bounded read. os.ReadDir materializes the whole
+		// directory before this loop can enforce the deadline.
+		if ctx.Err() != nil || childScanNow().After(deadline) {
 			return repos, true
 		}
-		if scanned >= 20 {
-			break
+		entries, readErr := childScanReadDir(directory, 1)
+		if errors.Is(readErr, io.EOF) {
+			return repos, false
 		}
+		if readErr != nil {
+			return repos, false
+		}
+		if ctx.Err() != nil || childScanNow().After(deadline) {
+			return repos, true
+		}
+		if len(entries) == 0 {
+			return repos, false
+		}
+		entry := entries[0]
 		if !entry.IsDir() {
 			continue
 		}
@@ -319,11 +632,13 @@ func scanChildren(dir string) (repos []string, timedOut bool) {
 		if noiseSet[name] {
 			continue
 		}
-		scanned++
 		childPath := filepath.Join(dir, name)
 		// Check if this child is a git repo (has a .git entry).
 		gitPath := filepath.Join(childPath, ".git")
 		if _, err := os.Stat(gitPath); err == nil {
+			if ctx.Err() != nil || childScanNow().After(deadline) {
+				return repos, true
+			}
 			repos = append(repos, childPath)
 			// Short-circuit: as soon as we have > 1, no need to keep scanning.
 			if len(repos) > 1 {
@@ -331,53 +646,48 @@ func scanChildren(dir string) (repos []string, timedOut bool) {
 			}
 		}
 	}
-	return repos, false
 }
 
-// DetectProject detects the project name for a given directory.
-// Priority: git remote origin repo name → git root basename → dir basename.
-// The returned name is always non-empty and already normalized (lowercase, trimmed).
-// This function is a backward-compatible wrapper around DetectProjectFull.
-// On ErrAmbiguousProject, falls back to filepath.Base(dir) so CLI callers
-// never receive an empty string (design §9 backward-compat requirement).
-func DetectProject(dir string) string {
-	res := DetectProjectFull(dir)
-	if errors.Is(res.Error, ErrAmbiguousProject) {
-		// CLI compat: return basename rather than empty string.
-		if dir == "" {
-			return "unknown"
-		}
-		base := filepath.Base(dir)
-		if base == "" || base == "." {
-			return "unknown"
-		}
-		return normalize(base)
-	}
-	if res.Project == "" {
-		return "unknown"
-	}
-	return res.Project
-}
-
-// normalize applies canonical project name rules: lowercase + trim whitespace.
-// It mirrors the normalization applied by the store layer so that DetectProject
-// always returns a value that is consistent with stored project names.
+// normalize applies the shared canonical project name rules and maps empty or
+// path-like values to unknown so basename detection always returns a valid name.
 func normalize(name string) string {
-	n := strings.TrimSpace(strings.ToLower(name))
-	if n == "" {
+	n := CanonicalizeProjectName(name)
+	if n == "" || strings.ContainsAny(n, `/\\`) {
 		return "unknown"
 	}
 	return n
+}
+
+// normalizeAvailableProject preserves the exact separator form of an ambiguous
+// child choice so downstream resolution can distinguish collisions.
+func normalizeAvailableProject(name string) string {
+	n := strings.TrimSpace(strings.ToLower(name))
+	if n == "" || strings.ContainsAny(n, `/\\`) {
+		return "unknown"
+	}
+	return n
+}
+
+func fallbackProjectName(dir string) string {
+	base := filepath.Base(dir)
+	if base == "" || base == "." {
+		return "unknown"
+	}
+	return normalize(base)
 }
 
 // detectFromGitRemote attempts to determine the project name from the git
 // remote "origin" URL. Returns empty string if git is unavailable, the
 // directory is not a repo, or there is no origin remote.
 func detectFromGitRemote(dir string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	return detectFromGitRemoteContext(context.Background(), dir)
+}
+
+func detectFromGitRemoteContext(parent context.Context, dir string) string {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
 
-	cmd := newProjectCommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin")
+	cmd := command.NewContext(ctx, "git", "-C", dir, "remote", "get-url", "origin")
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

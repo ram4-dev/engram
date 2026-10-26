@@ -11,6 +11,8 @@ metadata:
 
 ## When to Use
 
+The agent MUST follow this protocol without waiting for activation.
+
 Use this skill when:
 - Making architecture or implementation decisions
 - Fixing bugs with non-obvious root causes
@@ -55,3 +57,9 @@ After compaction:
 1. Save summary first.
 2. Recover context.
 3. Continue work.
+
+---
+
+## Delivery Guarantee
+
+Memory operations are internal bookkeeping, never the user-facing answer. Complete required memory work before composing the completed-task reply; send the complete answer as the final message of the turn with no later tool calls. If memory work fails or needs follow-up, still send the answer.
