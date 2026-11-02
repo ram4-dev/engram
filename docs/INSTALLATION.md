@@ -2,13 +2,21 @@
 
 # Installation
 
+- [Choose a release channel before installing](#choose-a-release-channel-before-installing)
 - [Homebrew (macOS / Linux)](#homebrew-macos--linux)
 - [Windows](#windows)
 - [Install from source (macOS / Linux)](#install-from-source-macos--linux)
 - [Download binary (all platforms)](#download-binary-all-platforms)
 - [Requirements](#requirements)
+- [Data-directory filesystem safety](#data-directory-filesystem-safety)
 - [Environment Variables](#environment-variables)
 - [Windows Config Paths](#windows-config-paths)
+
+---
+
+## Choose a release channel before installing
+
+The latest stable release is the production and security-supported line. Release candidates are prerelease validation and feedback builds, not a universal production recommendation or a guaranteed security-supported channel. See the [Release Policy](./RELEASE-POLICY.md) for channel, upgrade, and rollback guidance.
 
 ---
 
@@ -37,12 +45,21 @@ brew update && brew upgrade engram
 
 **Option A: Install via `go install` (recommended for technical users)**
 
-If you have Go installed, this is the cleanest and most trustworthy path — the binary is compiled on your machine from source, so no antivirus will flag it:
+If you have Go installed, you can compile the binary locally from source, but this does not guarantee protection from antivirus alerts or Windows security-policy blocking.
+
+Go's [Semantic Import Versioning](https://go.dev/ref/mod#major-version-suffixes) rule puts the major version in the module path starting at major version 2, so each major line has its own `go install` path. Pick the line that matches the major version you want:
 
 ```powershell
+# Current line (v3.x)
+go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest
+
+# Previous lines, only if you must stay on an older major version
+go install github.com/Gentleman-Programming/engram/v2/cmd/engram@latest
 go install github.com/Gentleman-Programming/engram/cmd/engram@latest
 # Binary goes to %GOPATH%\bin\engram.exe (typically %USERPROFILE%\go\bin\)
 ```
+
+The `/v3` command requires `v3.0.0` or a later v3 release. `@latest` selects the latest released version for the requested module path only; it never moves you to another major line.
 
 Ensure `%GOPATH%\bin` (or `%USERPROFILE%\go\bin`) is on your `PATH`.
 
@@ -106,8 +123,8 @@ Expand-Archive engram_*_windows_amd64.zip -DestinationPath "$env:USERPROFILE\bin
 > distribution trust problem, not a security problem. The source code is fully auditable.
 >
 > **Recommended workaround:** Technical Windows users should prefer **Option A (`go install`)** or
-> **Option B (build from source)**. Binaries you compile locally will not trigger AV alerts because
-> they originate from your own machine.
+> **Option B (build from source)**. Building locally is an option, not a guarantee against
+> antivirus alerts or Windows security-policy blocking.
 
 > **Other Windows notes:**
 > - Data is stored in `%USERPROFILE%\.engram\engram.db`
@@ -117,13 +134,69 @@ Expand-Archive engram_*_windows_amd64.zip -DestinationPath "$env:USERPROFILE\bin
 
 ---
 
+## Windows troubleshooting: executable blocked before MCP starts
+
+**Distinguish a missing executable from Windows rejecting an existing one.**
+Smart App Control or another security policy can prevent `engram.exe` from
+starting, including a locally compiled `go install` binary. Building locally is
+not a guarantee against security-policy blocking, despite the antivirus guidance
+above.
+
+| Observation | What to check |
+|-------------|---------------|
+| The configured executable does not exist, or the client resolves a different file | Check the exact MCP executable path and the installation location; this is a path-resolution problem. |
+| Windows explicitly reports that security policy blocked the existing executable | Treat this as an OS launch rejection, not an MCP protocol or argument error. |
+| Git Bash reports `Permission denied` / exit 126, or an MCP client reports `EUNKNOWN: uv_spawn` | These errors alone do not identify Smart App Control; correlate them with the Windows launch error and security-policy evidence. |
+| Authenticode status is `NotSigned` | This describes the file's signature, but does not by itself prove which policy blocked it. A signature status alone is not a policy diagnosis. |
+
+Issue #1703 reports Windows 11 Smart App Control enabled, an unsigned
+`engram.exe`, a PowerShell policy rejection, Git Bash exit 126, and a Claude Code
+MCP `EUNKNOWN: uv_spawn` error. These are reported observations, not an
+independently reproduced diagnosis for every similar startup failure.
+
+If Windows rejects the executable before it starts, the MCP server cannot begin
+its protocol exchange. Reinstalling or changing MCP arguments cannot be assumed
+to resolve that rejection. Locally compiled binaries are separate from release
+artifacts: signing a distributed release would not sign a local `go install`
+build. This guidance does not establish the signing status of current downloads
+or identify a signed workaround.
+
+**For a support report, collect only the relevant evidence:**
+
+- Installation route: `go install`, local source build, downloaded release, or installer.
+- Exact executable path configured in the MCP client, and whether that file exists.
+- Exact error from an already attempted direct launch of that same file, including the shell used; do not substitute only the MCP client's generic error.
+- Authenticode signature status for that same file, plus any explicit Windows security-policy message or known Smart App Control state.
+
+Redact personal path components when sharing evidence. Do not disable Smart App
+Control, antivirus, or other security controls to troubleshoot this issue. On a
+managed device, ask the security administrator to review the rejection under the
+organization's policy rather than attempting a bypass.
+
+---
+
 ## Install from source (macOS / Linux)
+
+Pick the line that matches the major version you want — the `/vN` suffix exists starting at major version 2 because of Go's [Semantic Import Versioning](https://go.dev/ref/mod#major-version-suffixes) rule:
+
+```bash
+# Current line (v3.x)
+go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest
+
+# Previous lines, only if you must stay on an older major version
+go install github.com/Gentleman-Programming/engram/v2/cmd/engram@latest
+go install github.com/Gentleman-Programming/engram/cmd/engram@latest
+# Binary goes to $GOPATH/bin (typically ~/go/bin/)
+```
+
+The `/v3` command requires `v3.0.0` or a later v3 release. `@latest` selects the latest released version for the requested module path only; it never moves you to another major line.
+
+Or build from a local clone:
 
 ```bash
 git clone https://github.com/Gentleman-Programming/engram.git
 cd engram
 go install ./cmd/engram
-# Binary goes to $GOPATH/bin (typically ~/go/bin/)
 ```
 
 > **Want a real version string instead of `dev`?**
@@ -164,10 +237,30 @@ Grab the latest release for your platform from [GitHub Releases](https://github.
 
 ## Requirements
 
-- **Go 1.24+** to build from source (not needed if installing via Homebrew or downloading a binary)
+- **Go 1.26+** to build from source (not needed if installing via Homebrew or downloading a binary)
 - That's it. No runtime dependencies.
 
 The binary includes SQLite (via [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) — pure Go, no CGO). Works natively on **macOS**, **Linux**, and **Windows** (x86_64 and ARM64).
+
+---
+
+## Data-directory filesystem safety
+
+Engram uses persistent SQLite WAL and rejects known NFS and SMB/CIFS data directories before changing the SQLite files. Use a local disk for `ENGRAM_DATA_DIR`; an unknown filesystem remains compatible but is not proven local.
+
+If startup rejects a network data directory, stop **all** Engram processes. Copy the complete `engram.db`, `engram.db-wal`, and `engram.db-shm` triplet to local storage, set `ENGRAM_DATA_DIR` to the absolute path of that local directory (relative paths are rejected), then start Engram and run `engram doctor`. Check SQLite integrity with the command for your shell:
+
+```bash
+# POSIX shell or Git Bash
+sqlite3 "$ENGRAM_DATA_DIR/engram.db" "PRAGMA integrity_check;"
+```
+
+```powershell
+# PowerShell
+sqlite3 (Join-Path $env:ENGRAM_DATA_DIR 'engram.db') 'PRAGMA integrity_check;'
+```
+
+Engram does not auto-repair, quarantine, checkpoint, or use rollback journaling as a fallback.
 
 ---
 
@@ -175,8 +268,9 @@ The binary includes SQLite (via [modernc.org/sqlite](https://pkg.go.dev/modernc.
 
 | Variable | Description | Default |
 |---|---|---|
-| `ENGRAM_DATA_DIR` | Data directory | `~/.engram` (Windows: `%USERPROFILE%\.engram`) |
-| `ENGRAM_PORT` | HTTP server port | `7437` |
+| `ENGRAM_DATA_DIR` | Engram CLI data directory. Empty or whitespace-only values use the platform default; nonblank values are used as provided. | `~/.engram` (Windows: `%USERPROFILE%\.engram`) |
+| `ENGRAM_PORT` | HTTP server port. Use an unsigned decimal value from `1` through `65535`; invalid values fall back to `7437` in `engram serve` and Claude Bash hooks. | `7437` |
+| `ENGRAM_SOCKET` | POSIX-only Unix-domain socket path. Run `engram serve --socket /path/to/engram.sock` (or set `ENGRAM_SOCKET`) to listen exclusively on the socket; do not combine it with an explicit TCP port. Claude Bash hooks use the same socket when the variable is exported and warn on stderr if socket transport cannot preserve memory capture. PowerShell remains TCP-only. | (unset) |
 
 ---
 
@@ -188,7 +282,7 @@ When using `engram setup`, config files are written to platform-appropriate loca
 |-------|---------------|---------|
 | OpenCode | `~/.config/opencode/` | `%APPDATA%\opencode\` |
 | Gemini CLI | `~/.gemini/` | `%APPDATA%\gemini\` |
-| Codex | `~/.codex/` | `%APPDATA%\codex\` |
+| Codex | `$CODEX_HOME/` when absolute, else `~/.codex/` | `%CODEX_HOME%\` when absolute, else `%USERPROFILE%\.codex\` |
 | Claude Code | Managed by `claude` CLI | Managed by `claude` CLI |
 | Antigravity CLI | `~/.gemini/config/mcp_config.json` + `~/.gemini/GEMINI.md` | `%APPDATA%\gemini\config\mcp_config.json` + `%APPDATA%\gemini\GEMINI.md` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` + `.../memories/global_rules.md` | `%USERPROFILE%\.codeium\windsurf\...` |
@@ -197,4 +291,6 @@ When using `engram setup`, config files are written to platform-appropriate loca
 | Cursor | `~/.cursor/mcp.json` + `~/.cursor/rules/engram.mdc` | `%USERPROFILE%\.cursor\...` |
 | VS Code Copilot | `~/.config/Code/User/mcp.json` + `.../prompts/engram.instructions.md` (macOS: `~/Library/Application Support/Code/User/`) | `%APPDATA%\Code\User\...` |
 | Kilo Code | `~/.config/kilo/opencode.json` + `~/.config/kilo/AGENTS.md` | `%USERPROFILE%\.config\kilo\...` |
+| Kimi Code | `~/.kimi-code/mcp.json` + `~/.kimi-code/AGENTS.md` | `%USERPROFILE%\.kimi-code\...` |
+| CommandCode | `~/.commandcode/mcp.json` + `~/.commandcode/AGENTS.md` | `%USERPROFILE%\.commandcode\mcp.json` + `%USERPROFILE%\.commandcode\AGENTS.md` |
 | Data directory | `~/.engram/` | `%USERPROFILE%\.engram\` |

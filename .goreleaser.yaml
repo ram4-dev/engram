@@ -2,9 +2,8 @@ version: 2
 
 project_name: engram
 
-before:
-  hooks:
-    - go mod tidy
+release:
+  prerelease: auto
 
 builds:
   - main: ./cmd/engram
@@ -28,6 +27,9 @@ archives:
   - formats:
       - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - tools/cloud-sync-projects.sh
+      - tools/cloud-sync-projects.ps1
     format_overrides:
       - goos: windows
         formats:
@@ -49,6 +51,7 @@ brews:
       owner: Gentleman-Programming
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    skip_upload: auto
     directory: Formula
     name: engram
     homepage: "https://github.com/Gentleman-Programming/engram"

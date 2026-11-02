@@ -9,13 +9,15 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	repoOwner = "Gentleman-Programming"
-	repoName  = "engram"
+	repoOwner        = "Gentleman-Programming"
+	repoName         = "engram"
+	EnvNoUpdateCheck = "ENGRAM_NO_UPDATE_CHECK"
 )
 
 var (
@@ -45,11 +47,20 @@ type githubRelease struct {
 // CheckLatest compares the running version against the latest GitHub release.
 // It distinguishes between up-to-date, update available, and check failures.
 func CheckLatest(current string) CheckResult {
+	if updateCheckDisabled() {
+		return CheckResult{}
+	}
+
 	switch current {
 	case "":
 		return checkFailed("Could not check for updates: current version is unknown.")
 	case "dev":
 		return checkFailed("Could not check for updates: development builds do not map to a release version.")
+	}
+
+	running := normalizeVersion(current)
+	if !isPlainRelease(running) {
+		return checkFailed("Could not check for updates: current version does not map to a plain release version.")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), checkTimeout)
@@ -83,9 +94,8 @@ func CheckLatest(current string) CheckResult {
 	}
 
 	latest := normalizeVersion(release.TagName)
-	running := normalizeVersion(current)
 
-	if latest == "" {
+	if !isPlainRelease(latest) {
 		return checkFailed("Could not check for updates: GitHub did not return a release version.")
 	}
 
@@ -106,12 +116,41 @@ func CheckLatest(current string) CheckResult {
 	}
 }
 
+func updateCheckDisabled() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(EnvNoUpdateCheck)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
 // normalizeVersion strips a leading "v" prefix.
 func normalizeVersion(v string) string {
 	return strings.TrimPrefix(strings.TrimSpace(v), "v")
 }
 
+// isPlainRelease accepts exactly three numeric components, without suffixes.
+// Bound each component to int so the numeric comparison cannot overflow.
+func isPlainRelease(v string) bool {
+	segments := strings.Split(v, ".")
+	if len(segments) != 3 {
+		return false
+	}
+	for _, segment := range segments {
+		if segment == "" || (len(segment) > 1 && segment[0] == '0') {
+			return false
+		}
+		for _, c := range segment {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		if _, err := strconv.Atoi(segment); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // isNewer returns true if latest > current using simple semver comparison.
+// Callers must validate both inputs with isPlainRelease first.
 func isNewer(latest, current string) bool {
 	latestParts := splitVersion(latest)
 	currentParts := splitVersion(current)
@@ -152,9 +191,9 @@ func updateInstructions() string {
 	case "darwin":
 		return "  brew update && brew upgrade engram"
 	case "linux":
-		return "  brew update && brew upgrade engram\n  or: go install github.com/Gentleman-Programming/engram/cmd/engram@latest"
+		return "  brew update && brew upgrade engram\n  or: go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 	default:
-		return "  go install github.com/Gentleman-Programming/engram/cmd/engram@latest\n  or: https://github.com/Gentleman-Programming/engram/releases/latest"
+		return "  go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest\n  or: https://github.com/Gentleman-Programming/engram/releases/latest"
 	}
 }
 

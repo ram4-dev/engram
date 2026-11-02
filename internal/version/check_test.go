@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,31 @@ func TestNormalizeVersion(t *testing.T) {
 		if got := normalizeVersion(tt.in); got != tt.want {
 			t.Errorf("normalizeVersion(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestUpdateCheckDisabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "unset", value: "", want: false},
+		{name: "one", value: "1", want: true},
+		{name: "true", value: "true", want: true},
+		{name: "yes", value: "yes", want: true},
+		{name: "on", value: "on", want: true},
+		{name: "case and whitespace", value: " TRUE ", want: true},
+		{name: "other value", value: "0", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(EnvNoUpdateCheck, tt.value)
+			if got := updateCheckDisabled(); got != tt.want {
+				t.Fatalf("updateCheckDisabled() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -59,7 +85,76 @@ func TestIsNewer(t *testing.T) {
 	}
 }
 
+func TestCheckLatestRejectsNonReleaseVersions(t *testing.T) {
+	t.Setenv(EnvNoUpdateCheck, "")
+	for _, current := range []string{
+		"3.0.0-20261023222254-ac07f6f1650b",
+		"3.5.5-0.20261023222254-ac07f6f1650b",
+		"main", "1.2", "1.2.3-beta", "1.2.3+build", "1.2.3.4",
+		"01.2.3", "1..3", "-1.2.3", "999999999999999999999999999999.2.3",
+	} {
+		t.Run(current, func(t *testing.T) {
+			calls := 0
+			oldClient := httpClient
+			httpClient = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				calls++
+				return nil, fmt.Errorf("unexpected request")
+			})}
+			t.Cleanup(func() { httpClient = oldClient })
+			result := CheckLatest(current)
+			want := checkFailed("Could not check for updates: current version does not map to a plain release version.")
+			if result != want || calls != 0 {
+				t.Fatalf("CheckLatest(%q) = %+v, HTTP calls = %d; want %+v, 0 calls", current, result, calls, want)
+			}
+		})
+	}
+}
+
+func TestCheckLatestReleaseValidation(t *testing.T) {
+	t.Setenv(EnvNoUpdateCheck, "")
+	for _, tt := range []struct {
+		current, latest string
+		want            CheckResult
+	}{
+		{"v3.5.4", "v3.5.4", CheckResult{Status: StatusUpToDate}},
+		{"3.5.5", "v3.5.4", CheckResult{Status: StatusUpToDate}},
+		{"0.0.0", "v0.0.1", CheckResult{Status: StatusUpdateAvailable, Message: fmt.Sprintf("Update available: 0.0.0 -> 0.0.1\nTo update:\n%s", updateInstructions())}},
+		{"3.5.4", "main", checkFailed("Could not check for updates: GitHub did not return a release version.")},
+		{"3.5.4", "v4.0.0-beta", checkFailed("Could not check for updates: GitHub did not return a release version.")},
+		{"3.5.4", "v4.0", checkFailed("Could not check for updates: GitHub did not return a release version.")},
+	} {
+		t.Run(tt.current+"/"+tt.latest, func(t *testing.T) {
+			withCheckServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"tag_name":%q}`, tt.latest)
+			}))
+			if got := CheckLatest(tt.current); got != tt.want {
+				t.Fatalf("CheckLatest(%q) = %+v, want %+v", tt.current, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCheckLatest(t *testing.T) {
+	t.Run("opt out skips the HTTP transport for a released version", func(t *testing.T) {
+		t.Setenv("ENGRAM_NO_UPDATE_CHECK", "1")
+
+		calls := 0
+		oldClient := httpClient
+		httpClient = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			return nil, fmt.Errorf("update check transport should not run")
+		})}
+		t.Cleanup(func() { httpClient = oldClient })
+
+		result := CheckLatest("1.10.7")
+		if calls != 0 {
+			t.Fatalf("HTTP transport calls = %d, want 0", calls)
+		}
+		if result != (CheckResult{}) {
+			t.Fatalf("result = %+v, want empty result", result)
+		}
+	})
+
 	t.Run("dev and empty versions fail honestly", func(t *testing.T) {
 		result := CheckLatest("dev")
 		if result.Status != StatusCheckFailed {
@@ -170,6 +265,12 @@ func TestCheckLatest(t *testing.T) {
 	})
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func TestCheckLatestUsesGitHubToken(t *testing.T) {
 	t.Run("prefers GH_TOKEN", func(t *testing.T) {
 		t.Setenv("GH_TOKEN", "gh-token")
@@ -221,6 +322,12 @@ func TestUpdateInstructions(t *testing.T) {
 	msg := updateInstructions()
 	if msg == "" {
 		t.Fatal("expected non-empty update instructions")
+	}
+	if runtime.GOOS != "darwin" && !strings.Contains(msg, "github.com/Gentleman-Programming/engram/v3/cmd/engram@latest") {
+		t.Fatalf("update instructions = %q, want v3 Go install command", msg)
+	}
+	if runtime.GOOS != "linux" && !strings.Contains(msg, "https://github.com/Gentleman-Programming/engram/releases/latest") {
+		t.Fatalf("update instructions = %q, want canonical GitHub Releases URL", msg)
 	}
 }
 
