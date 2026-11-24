@@ -32,6 +32,15 @@ type Transport interface {
 	ReadChunk(chunkID string) ([]byte, error)
 }
 
+// ChunkEvidenceTransport opts into persistent per-chunk dependency summaries.
+// The scope must identify the source and project, without credentials. Within
+// that scope a chunk ID must always identify the same immutable payload. A new
+// source/namespace must use a different scope. Other transports are uncached.
+type ChunkEvidenceTransport interface {
+	Transport
+	ChunkEvidenceScope() string
+}
+
 // ─── FileTransport ──────────────────────────────────────────────────────────
 
 // FileTransport reads/writes chunks to the local filesystem.
@@ -53,6 +62,9 @@ func (ft *FileTransport) ReadManifest() (*Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if info, statErr := os.Stat(ft.syncDir); statErr == nil && !info.IsDir() {
+				return nil, fmt.Errorf("read manifest: sync path %q is not a directory", ft.syncDir)
+			}
 			return &Manifest{Version: 1}, nil
 		}
 		return nil, fmt.Errorf("read manifest: %w", err)
